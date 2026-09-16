@@ -1,5 +1,10 @@
 <?php
 
+use App\Models\Plan;
+use App\Models\PlanFeature;
+use App\Models\Subscription;
+use App\Models\Tenant;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Str;
 
 return [
@@ -131,6 +136,12 @@ return [
     |
     */
 
-    'serializable_classes' => false,
+    'serializable_classes' => [
+        Collection::class,
+        Plan::class,
+        PlanFeature::class,
+        Subscription::class,
+        Tenant::class,
+    ],
 
 ];
