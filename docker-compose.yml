@@ -1,0 +1,82 @@
+name: saas-tenant-api
+
+services:
+  app:
+    container_name: saas-app
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ./src:/var/www
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "php -v > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  nginx:
+    container_name: saas-nginx
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:80"
+    volumes:
+      - ./src:/var/www:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # No container_name: a fixed name would block `docker compose up --scale worker=N`.
+  worker:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: unless-stopped
+    command: php artisan queue:work --queue=high,default,low --tries=3 --max-time=3600
+    volumes:
+      - ./src:/var/www
+    depends_on:
+      app:
+        condition: service_healthy
+
+  db:
+    container_name: saas-db
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      TZ: UTC
+      POSTGRES_DB: ${DB_DATABASE:-saas}
+      POSTGRES_USER: ${DB_USERNAME:-saas}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-saas} -d ${DB_DATABASE:-saas}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    container_name: saas-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  redisdata:

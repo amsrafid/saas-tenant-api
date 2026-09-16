@@ -40,6 +40,7 @@ Merging them behind a `type` column would put nullable auth columns on every cus
 | `name` | varchar(255) | company name |
 | `slug` | varchar(255) | **unique**, URL-safe identity |
 | `status` | varchar(20) | enum-backed: `active`, `suspended` |
+| `timezone` | varchar(64) | IANA name, default `Asia/Dhaka` — see §3 |
 | `trial_ends_at` | timestamptz null | |
 | `created_at` / `updated_at` | timestamptz | |
 
@@ -135,6 +136,11 @@ CREATE UNIQUE INDEX subscriptions_one_active_per_tenant
   WHERE status IN ('trialing', 'active');
 ```
 Historical rows are unaffected because the predicate excludes them. This is a concrete reason the stack is Postgres rather than MySQL, which has no partial indexes.
+
+**Timestamps are stored in UTC; each tenant carries its own display timezone.**
+The assignment says nothing about timezones, so this is a decision rather than a requirement. Storage is UTC everywhere (`timestamptz`, `APP_TIMEZONE=UTC`, the database container pinned to `TZ=UTC`) because a tenant in London and a tenant in Dhaka cannot share one local clock — UTC is nobody's local time, which is exactly what makes it neutral. The API returns ISO-8601 with an offset and lets the client render.
+
+A single stored timezone is not enough, though, because **some boundaries are business boundaries, not display**. `api_requests_per_day` resets at a *day* boundary: computed in UTC, a Dhaka tenant's quota would reset at 6 a.m. local, which is impossible to explain to them. The same applies to "today" in dashboard analytics. So `tenants.timezone` (IANA name, default `Asia/Dhaka`) determines where a period starts and ends; the resulting instants are still stored in UTC. Nothing in the schema stores local time.
 
 **Enum values are stored as strings, not integers.** A dump stays readable and a value's meaning survives a code change that reorders an enum.
 

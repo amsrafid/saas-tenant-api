@@ -36,7 +36,7 @@ plans:active                              → platform-wide active plan list (no
 |---|---|---|---|
 | `tenant:{id}:subscription` | **24 hours** | `Subscription`, `Plan`, `PlanFeature` observers | Read on nearly every request; every write that could change it fires an observer |
 | `tenant:{id}:usage:counts` | **24 hours** | `User`, `Customer` create/delete observers | Count-based limits change only through Eloquent writes, all of which are observed |
-| `tenant:{id}:dashboard:{date}` | **24 hours** | the same write observers | The date in the key makes period rollover self-invalidating, so no short TTL is needed to keep the growth series current |
+| `tenant:{id}:dashboard:{date}` | **24 hours** | the same write observers | The date in the key makes period rollover self-invalidating, so no short TTL is needed to keep the growth series current. The date is the tenant's local date ([database §3](database.md)), not the UTC one, so a tenant's "today" turns over at their midnight |
 | `plans:active` | **24 hours** | `Plan`, `PlanFeature` observers | Platform-wide, changes only on an admin edit |
 | `tenant:{id}:usage:metered:{period}` | **60 seconds** | nothing — incremented continuously | The exception: API request counts rise without any Eloquent event to hook, so this one genuinely depends on expiry. Kept short and deliberately called out as the only such key |
 
