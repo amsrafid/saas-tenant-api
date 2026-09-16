@@ -1,0 +1,39 @@
+# Laravel application (lives in src/)
+/src/vendor/
+/src/node_modules/
+/src/.env
+/src/.env.backup
+/src/.env.production
+/src/public/storage
+/src/public/hot
+/src/public/build
+/src/storage/*.key
+/src/storage/pail
+/src/storage/logs/*
+!/src/storage/logs/.gitkeep
+/src/storage/framework/cache/data/*
+/src/storage/framework/sessions/*
+/src/storage/framework/testing/*
+/src/storage/framework/views/*
+/src/bootstrap/cache/*
+!/src/bootstrap/cache/.gitkeep
+/src/.phpunit.cache
+/src/.phpunit.result.cache
+/src/auth.json
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Tooling / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Internal working files — not part of the submission
+.claude/
+CLAUDE.md
+docs/planning/
+docs/assets/
