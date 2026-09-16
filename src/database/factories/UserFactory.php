@@ -2,18 +2,22 @@
 
 namespace Database\Factories;
 
+use App\Enums\TenantRole;
+use App\Enums\UserStatus;
+use App\Models\Tenant;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Factories\Factory;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Str;
 
 /**
+ * Builds User models for tests and seeders.
+ *
  * @extends Factory<User>
  */
 class UserFactory extends Factory
 {
     /**
-     * The current password being used by the factory.
+     * The hashed password shared by every generated user, computed once.
      */
     protected static ?string $password;
 
@@ -25,21 +29,31 @@ class UserFactory extends Factory
     public function definition(): array
     {
         return [
+            'tenant_id' => Tenant::factory(),
             'name' => fake()->name(),
             'email' => fake()->unique()->safeEmail(),
-            'email_verified_at' => now(),
             'password' => static::$password ??= Hash::make('password'),
-            'remember_token' => Str::random(10),
+            'role' => TenantRole::Member,
+            'status' => UserStatus::Active,
         ];
     }
 
     /**
-     * Indicate that the model's email address should be unverified.
+     * A tenant owner.
      */
-    public function unverified(): static
+    public function owner(): static
     {
-        return $this->state(fn (array $attributes) => [
-            'email_verified_at' => null,
+        return $this->state(['role' => TenantRole::Owner]);
+    }
+
+    /**
+     * A platform admin, outside every tenant.
+     */
+    public function platformAdmin(): static
+    {
+        return $this->state([
+            'tenant_id' => null,
+            'role' => TenantRole::PlatformAdmin,
         ]);
     }
 }
