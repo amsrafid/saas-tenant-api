@@ -9,12 +9,7 @@ if grep -q '^APP_KEY=$' .env; then
     php artisan key:generate
 fi
 
-# Seed only a database that has never been migrated, so a restart never duplicates demo data.
-if php artisan migrate:status > /dev/null 2>&1; then
-    php artisan migrate --force
-else
-    php artisan migrate --force --seed
-fi
+php artisan migrate --force --seed
 
 cat <<INFO
 
@@ -24,6 +19,11 @@ cat <<INFO
   Demo credentials (password: password)
     Platform admin   admin@platform.test
     Acme owner       owner@acme.test
+    Acme admin       admin@acme.test
+    Acme member      member1@acme.test
+    Acme member      member2@acme.test
     Globex owner     owner@globex.test
+    Globex admin     admin@globex.test
+    Globex member    member@globex.test
 
 INFO
