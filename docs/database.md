@@ -31,6 +31,8 @@ Merging them behind a `type` column would put nullable auth columns on every cus
 
 `plans` and `plan_features` are **platform-owned, not tenant-owned** — they carry no `tenant_id` and are excluded from the tenant global scope.
 
+**Framework tables are kept to the two that need a database.** Cache, queue and sessions all run on Redis, so Laravel's default `cache`, `cache_locks`, `jobs`, `job_batches` and `sessions` tables are not created. `personal_access_tokens` stays because Sanctum tokens must be durable. `failed_jobs` stays because Laravel records failed jobs in the database even when the queue itself is Redis — a failed job is evidence to inspect and retry, not something to lose on a Redis eviction. `password_reset_tokens` is dropped: no password-reset endpoint is in scope.
+
 ## 2. Tables
 
 ### `tenants`
@@ -118,7 +120,7 @@ History is preserved: changing plans ends the current subscription and inserts a
 Only **metered** features (API requests) need rows here. **Count-based** limits (users, customers) are derived with a `COUNT` against the source table and cached — storing a counter for something already countable invites drift between the counter and reality.
 
 ### `personal_access_tokens`
-Sanctum's standard table, unmodified.
+Sanctum's standard table, with its timestamps changed to `timestamptz` like every other table.
 
 ## 3. Decisions worth defending
 
@@ -151,6 +153,8 @@ A single stored timezone is not enough, though, because **some boundaries are bu
 Migrations are ordered so foreign keys always resolve: `tenants` → `users` → `plans` → `plan_features` → `subscriptions` → `customers` → `feature_usage`.
 
 Seeders produce a reviewable dataset in one command: three plans (Free / Pro / Enterprise with real limits including one unlimited), two tenants with separate users and customers, and one platform admin. **Two tenants is deliberate** — a reviewer can log in as each and confirm isolation without creating data first.
+
+**Tests never touch the seeded database.** Pest runs against a separate `saas_testing` database on the same Postgres server, created by a container init script. Tests stay on Postgres rather than in-memory SQLite because the behaviour under test is Postgres-specific — partial unique indexes, `timestamptz`, and concurrent subscribe (T-06).
 
 ## 5. Indexing strategy
 

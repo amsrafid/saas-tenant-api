@@ -1,5 +1,12 @@
 name: saas-tenant-api
 
+# Database credentials live only here. Laravel reads them from the container environment,
+# which takes precedence over src/.env, so the two can never disagree.
+x-database-credentials: &database-credentials
+  DB_DATABASE: ${DB_DATABASE:-saas}
+  DB_USERNAME: ${DB_USERNAME:-saas}
+  DB_PASSWORD: ${DB_PASSWORD:-secret}
+
 services:
   app:
     container_name: saas-app
@@ -7,6 +14,7 @@ services:
       context: .
       dockerfile: docker/php/Dockerfile
     restart: unless-stopped
+    environment: *database-credentials
     volumes:
       - ./src:/var/www
     depends_on:
@@ -38,6 +46,7 @@ services:
       dockerfile: docker/php/Dockerfile
     restart: unless-stopped
     command: php artisan queue:work --queue=high,default,low --tries=3 --max-time=3600
+    environment: *database-credentials
     volumes:
       - ./src:/var/www
     depends_on:
@@ -53,6 +62,7 @@ services:
     restart: "no"
     command: ["sh", "/usr/local/bin/setup.sh"]
     environment:
+      <<: *database-credentials
       APP_PORT: ${APP_PORT:-8000}
     volumes:
       - ./src:/var/www
@@ -74,8 +84,10 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Runs only when the volume is first initialised; Pest runs against this database, never the seeded one.
+      - ./docker/postgres/create-testing-database.sh:/docker-entrypoint-initdb.d/create-testing-database.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-saas} -d ${DB_DATABASE:-saas}"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10
