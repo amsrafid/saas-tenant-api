@@ -10,10 +10,8 @@ services:
     volumes:
       - ./src:/var/www
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "php -v > /dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -44,6 +42,25 @@ services:
       - ./src:/var/www
     depends_on:
       app:
+        condition: service_healthy
+
+  # One-shot: installs dependencies, migrates, and seeds a new database, then exits.
+  # Invoked via sh so it runs regardless of the file's executable bit on Windows checkouts.
+  setup:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: "no"
+    command: ["sh", "/usr/local/bin/setup.sh"]
+    environment:
+      APP_PORT: ${APP_PORT:-8000}
+    volumes:
+      - ./src:/var/www
+      - ./docker/php/setup.sh:/usr/local/bin/setup.sh:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   db:
