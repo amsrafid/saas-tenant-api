@@ -4,90 +4,112 @@ Covers submission requirement **#5** (caching strategy and invalidation). Redis 
 
 ---
 
-## 1. What gets cached, and what does not
+## 1. What is cached
 
-Caching is a decision per case, not a default. A value is cached only when it is **read far more often than written** and **expensive or repetitive to produce**.
+Read-through `Cache::remember()` on Redis. A value with reliable invalidation gets **24 hours**; there is no `Cache::forever()`, so a missed invalidation heals within a day.
 
-| Cached | Not cached |
-|---|---|
-| Active subscription + plan limits (read on nearly every request) | Customer and user listings — filtered, sorted and paginated, so the key space is unbounded and the hit rate would be near zero |
-| Active plan list (changes rarely, read publicly) | Anything a client can vary freely by query string |
-| Dashboard analytics (aggregate queries over the whole tenant) | Single-record reads — already a primary-key index hit; caching would add a network round-trip to save one |
-| Usage counts against limits | Auth state — Sanctum resolves the token per request by design |
-
-Caching a paginated listing is the common mistake here: it multiplies keys by every filter/sort/page combination, so almost every read misses while every write has to invalidate a set nobody can enumerate.
-
-## 2. Key naming — every tenant-owned key carries its tenant
-
-```
-tenant:{tenant_id}:subscription           → active subscription + plan + features
-tenant:{tenant_id}:usage:{period_start}   → per-feature usage counts
-tenant:{tenant_id}:dashboard              → analytics payload
-plans:active                              → platform-wide active plan list (no tenant segment: not tenant data)
-```
-
-**A missing tenant segment in a key is a cross-tenant data leak, not a performance bug.** Keys are therefore built only by a `CacheKey` helper that takes the tenant from `TenantContext` — never by string concatenation at the call site. This is exactly the kind of mistake that is invisible in review and obvious in production.
-
-## 3. TTLs — length follows invalidation reliability, not guesswork
-
-**A TTL is a safety net, not the invalidation strategy.** It follows that a value with reliable observer-based invalidation should have a *long* TTL: expiry is never the mechanism that keeps it correct, so a short one only costs recomputation. A value that must expire quickly to stay correct is a value whose invalidation is missing — a design smell to fix, not a number to tune.
-
-| Key | TTL | Invalidated by | Reasoning |
+| Key | TTL | Read by | Invalidated by |
 |---|---|---|---|
-| `tenant:{id}:subscription` | **24 hours** | `Subscription`, `Plan`, `PlanFeature` observers | Read on nearly every request; every write that could change it fires an observer |
-| `tenant:{id}:usage:counts` | **24 hours** | `User`, `Customer` create/delete observers | Count-based limits change only through Eloquent writes, all of which are observed |
-| `tenant:{id}:dashboard:{date}` | **24 hours** | the same write observers | The date in the key makes period rollover self-invalidating, so no short TTL is needed to keep the growth series current. The date is the tenant's local date ([database §3](database.md)), not the UTC one, so a tenant's "today" turns over at their midnight |
-| `plans:active` | **24 hours** | `Plan`, `PlanFeature` observers | Platform-wide, changes only on an admin edit |
-| `tenant:{id}:usage:metered:{period}` | **60 seconds** | nothing — incremented continuously | The exception: API request counts rise without any Eloquent event to hook, so this one genuinely depends on expiry. Kept short and deliberately called out as the only such key |
+| `tenant:{id}` | 24 h | `TenantRepository::find()` — `ResolveTenant` on every tenant request, `GET /auth/me`, login | `TenantObserver` (`updated`, `deleted`) → `TenantRepository::forget()` |
+| `plan:{slug}` | 24 h | `PlanRepository::findBySlug()` — the plan with its features: registration's Free plan, `GET /plans/{slug}`, the plan-limit check on user and customer create | `PlanObserver` (`created`, `updated`, `deleted`) → `PlanRepository::forget($slug)`; plus one explicit call in `PlanService::update()` (§2) |
+| `plans:active` | 24 h | `PlanRepository::active()` — every active plan with its features, `GET /plans` | the same `forget()`: it drops `plan:{slug}` and `plans:active` together, so no plan write can miss the list |
+| `tenant:{id}:subscription` | 24 h | `SubscriptionRepository::current()` — the tenant's live (`active`) subscription plus its plan's slug, for every `/subscription` endpoint, the dashboard and the plan-limit check | `SubscriptionObserver` (`created`, `updated`, `deleted`) → `SubscriptionRepository::forget($tenantId)` |
+| `platform:analytics` | 24 h | `AdminService::analytics()` — `GET /admin/analytics`, the `platform_stats` row and `plan_stats` joined to `plans`, cached as a plain array | `AdminService::forgetAnalytics()`, from `PlatformStatsObserver` (`created`, `updated`) and from `RefreshPlatformStats` after its `plan_stats` upsert (an upsert fires no event) — the only writes the figures are read from; a refresh that changes no figure clears nothing |
 
-**No `Cache::forever()` anywhere.** An unbounded key with a missed invalidation is stale permanently, with no self-healing path. 24 hours is the ceiling: long enough that expiry is irrelevant in practice, short enough that a bug repairs itself within a day.
+A null result (a missing plan, a tenant with no live subscription) is stored by `remember()` but read back as a miss, so it is never served from cache.
 
-## 4. Invalidation — observers, not TTLs
+**No in-request memo.** `PlanRepository` and `SubscriptionRepository` read Redis directly. A repeated read in one request is a sub-millisecond Redis GET, not a database query, so a memo layer is not worth its extra rules yet.
 
-**The TTL is not the invalidation strategy; the observer is.** The TTL only bounds the damage if an observer is ever missed.
+Each key holds only the columns its consumers read: a tenant is `id`, `name`, `slug`, `status`, `timezone`; a plan is its API fields without `sort_order` or timestamps, with features as `plan_id`, `key`, `limit_value`. A new consumer that needs another column adds it to the repository's select.
 
-| Event | Invalidates |
-|---|---|
-| `Subscription` created / updated / deleted | `tenant:{id}:subscription`, `tenant:{id}:dashboard` |
-| `Plan` or `PlanFeature` saved / deleted | `plans:active`, **and** `tenant:{id}:subscription` for every tenant on that plan |
-| `User` created / deleted | `tenant:{id}:usage:*`, `tenant:{id}:dashboard` |
-| `Customer` created / deleted | `tenant:{id}:usage:*`, `tenant:{id}:dashboard` |
-| `Tenant` updated | `tenant:{id}:dashboard` |
+**The subscription key holds no limits.** It caches the subscription's `id`, `tenant_id` (for `SubscriptionObserver`), `plan_id`, `status`, `starts_at`, `ends_at` and `canceled_at` and its plan's `slug` (one join); the limits are read from `plan:{slug}`, which every plan write already drops. A platform admin editing a plan's limits therefore reaches every subscribed tenant on the next request, with no per-tenant fan-out — a plan's slug never changes, so the link cannot go stale. The price is a second cache read per request.
 
-Three details that make this correct rather than merely present:
+**Analytics aggregates nothing on a request.** The figures are precomputed into `platform_stats` and `plan_stats` by `RefreshPlatformStats` (§7, [database §2](database.md)); a miss is two plain selects, no `count`, `sum` or `GROUP BY` (a test asserts it from the query log). The cache still earns its place: a hit runs no query, and invalidation is exact — the key is dropped only when a stats row actually changes, at most once per refresh (~30 s under continuous writes).
 
-1. **Eloquent events do not fire on bulk operations.** A mass `insert()`, `update()` or `delete()` bypasses observers entirely. Every such call site carries an explicit `forget()`; there are few, and they are listed in the README.
-2. **A plan edit fans out.** Changing `max_users` on the Pro plan must invalidate the cached limits of *every* tenant on Pro, not just the plan list. This is handled by a queued job on the `low` queue — correctness without blocking the admin's request.
-3. **Limits are re-checked at write time, inside the transaction.** The cached usage count drives the *response* (a fast "you have 3 seats left"), but the authoritative check before creating a user or customer reads the real count. A cache must never be the last line of defence for a business invariant — a stale count would otherwise let a tenant exceed a paid limit.
+`plans:active` holds the whole active catalogue and `GET /plans` pages it in memory, so one key serves every `page`/`per_page` and one `forget()` clears it. That is sound only because the catalogue is a handful of rows written by a platform admin; a catalogue that grew large would page in SQL instead, with the page in the key.
 
-Cache writes use `Cache::remember()` (read-through), so a miss repopulates transparently and no code path can read a half-populated value.
+## 2. Invalidation — model observers, after commit
+
+**Invalidation lives in model observers, not in the services that write.** One observer per model, attached with `#[ObservedBy]`, so every write through Eloquent — a service, a seeder, `tinker`, a test factory — drops what it makes stale, and a new service cannot forget to. Every `forget()` and every dispatch runs only once the transaction commits, so a concurrent read cannot re-cache the old row between the forget and the commit, and a rolled-back write drops nothing. The `Plan`, `Subscription`, `PlatformStats` and `PlanStats` observers implement `ShouldHandleEventsAfterCommit`. The `Tenant`, `Customer` and `User` observers do not: they write `tenant_stats` **inside** the write's transaction (the zeroed row, the counter), so the count commits or rolls back with the row, and they defer their cache drops and dispatches with `DB::afterCommit()` instead.
+
+**Observers listen to `created`/`updated`/`deleted`, never `saved`.** `save()` fires `saved` even when nothing is dirty; `updated` fires only when a column actually changed. So an identical `RefreshPlatformStats` run, or a no-op `PATCH`, clears nothing (the refresh case is tested).
+
+| Observer | Events | Does |
+|---|---|---|
+| `TenantObserver` | `created` | inserts the tenant's zeroed `tenant_stats` row in the same transaction (so the owner's increment in registration finds it); dispatches `RefreshPlatformStats` after commit |
+| | `updated` | after commit: `TenantRepository::forget($id)`; dispatches `RefreshPlatformStats` only when `status` changed |
+| | `deleted` | after commit: `TenantRepository::forget($id)`, dispatches `RefreshPlatformStats` |
+| `PlanObserver` | `created`, `updated`, `deleted` | `PlanRepository::forget($slug)`, dispatches `RefreshPlatformStats` (price, currency and billing period feed MRR; a new plan gets its `plan_stats` row from the job) |
+| `SubscriptionObserver` | `created`, `updated`, `deleted` | `SubscriptionRepository::forget($tenantId)`, dispatches `RefreshPlatformStats` |
+| `PlatformStatsObserver` | `created`, `updated` | `AdminService::forgetAnalytics()` (`plan_stats` is upserted by `RefreshPlatformStats`, which clears it itself) |
+| `CustomerObserver`, `UserObserver` | `created`, `deleted` | in the write's transaction: `tenant_stats` `customers_count`/`users_count` `+ 1` / `- 1` (one `UPDATE … SET n = n + 1` on the primary key, O(1) at any tenant size); `CustomerObserver::created` also upserts `+ 1` into the tenant's `tenant_monthly_stats` month ([database §2](database.md)); `RefreshPlatformStats` after commit (§7). A platform admin (no tenant) touches nothing |
+
+`DatabaseSeeder` no longer uses `WithoutModelEvents`, so seeding goes through the same observers.
+
+**Where an observer cannot fire, the code that writes calls `forget()` itself**, with a one-line comment saying why:
+
+| Write | Why no event | Explicit call |
+|---|---|---|
+| `PlanFeature::upsert()` in `PlanService` | a query-builder upsert fires no model events; a limits-only `PATCH /admin/plans/{id}` changes no plan column | `PlanService::update()` calls `PlanRepository::forget($slug)` after the transaction. `create()` needs none: the plan insert in the same transaction fires `PlanObserver` after commit |
+| The `tenant_stats` counter `increment()` in `CustomerObserver`/`UserObserver` | a query-builder increment fires no `TenantStats` event | the observer dispatches `RefreshPlatformStats` itself, inside `DB::afterCommit()` |
+| `DatabaseSeeder` refreshes platform stats | not a cache — the queued refresh would land after setup ends | runs `RefreshPlatformStats::handle()` in-process last; a re-run writes nothing, since an unchanged model saves no row |
+| `ProcessDueSubscriptions` expires subscriptions with a builder `update()` per `chunkById` chunk of ids | a builder update fires no `SubscriptionObserver` | the job calls `SubscriptionRepository::forgetMany()` with the chunk's tenant ids, and dispatches `RefreshPlatformStats` once at the end when anything expired |
+| A plan or tenant delete cascades to its `plan_stats` / `tenant_stats` row | a foreign-key cascade fires no model event | none needed: the `deleted` observer dispatches `RefreshPlatformStats`, whose saves drop the analytics key |
+
+Any future mass `update()`/`delete()`/`insert()` on a query builder fires no events either and must call the repository `forget()` for each tenant it touches, and dispatch `RefreshPlatformStats` once. Plain token deletes (`$user->tokens()->delete()`) touch nothing cached. A plan limit enforced for a business rule is still re-checked at write time; the cache is never the last line of defence.
+
+## 3. Serialisation
+
+Laravel 13 refuses to unserialise objects from the cache unless their class is allowed, so `config/cache.php` lists `Plan`, `PlanFeature`, `Subscription`, `Tenant` and the Eloquent `Collection` (the active plan list, and the `features` relation inside each cached plan) in `serializable_classes`. A model cached later must be added there. Tests use the non-serialising array store, so `PlanEndpointsTest` and `SubscriptionEndpointsTest` switch it to serialising once to catch a missing class.
+
+## 4. Not cached, deliberately
+
+- **Login's user lookup** — reads credentials and status; a cached copy would accept a changed password or a disabled account.
+- **Sanctum's token and user lookup** — revoking a token (logout) must take effect on the very next request.
+- **Customers** — listings vary by filter, search and page, change often, and are cheap indexed queries; a cache would miss most of the time and be flushed on every write.
+- **Subscription usage** (`GET /subscription/usage`, the downgrade check, the plan-limit check on user and customer create) — one query of primary-key lookups on `tenant_stats`. It is already a pre-aggregated read; caching it would add a second copy to invalidate.
+- **Tenant dashboard** (`GET /dashboard/analytics`) — built from exactly the figures that change fastest: the user and customer counts and the growth month change on every create. A cached copy would be dropped by every customer write of a busy tenant. Uncached it is already O(1) — the cached subscription and plan, one `tenant_stats` primary-key read, and at most twelve `tenant_monthly_stats` rows by primary-key range — so a cache would add an invalidation path and save two indexed reads.
+- **Anything without an invalidation path** — it would be correct only by expiry.
 
 ## 5. Query performance
 
-Covered in detail in [database §5–§6](database.md). In summary: indexes follow real query patterns with the two Postgres traps checked explicitly, every relation touched in a loop is eager-loaded, aggregates are computed in SQL, and listing/dashboard endpoints carry Pest query-count assertions so a reintroduced N+1 fails the test suite rather than review.
+Covered in detail in [database §5–§6](database.md). In summary: indexes follow real query patterns with the two Postgres traps checked explicitly, every relation touched in a loop is eager-loaded, aggregates are computed in SQL, and listing/dashboard endpoints carry Pest query-count assertions (the dashboard's asserts its exact SQL) so a reintroduced N+1 fails the test suite rather than review.
 
 ## 6. Rate limiting
 
-| Limiter | Limit | Key |
+Named limiters in `AppServiceProvider`, applied with Laravel's `throttle:{name}` middleware. No custom middleware: a limiter returns a `Limit`, and the framework's `ThrottleRequests` does the counting, the 429 and the headers.
+
+| Limiter | Limit | Key | Routes |
+|---|---|---|---|
+| `auth` | 5 / minute | submitted email + IP — slows credential stuffing without locking a real user out by IP alone | `POST /auth/login`, `POST /auth/register` (one shared bucket) |
+| `register` | 10 / hour | IP | `POST /auth/register` — each registration creates a tenant, so a fresh email per attempt must not bypass the limit |
+| `public` | 60 / minute | IP | `GET /plans`, `GET /plans/{slug}` — unauthenticated, and an unknown slug costs a query |
+| `api` | 60 / minute | authenticated user id (from `AuthUserService`) | every `auth:sanctum` route: `/auth/logout`, `/auth/me`, `/admin/*`, tenant routes |
+
+All buckets live in Redis (the cache store, db 1), so limits hold across every application container rather than per-process. Tests run the same limiters on the array store with `travel()` for resets.
+
+## 7. Background jobs — one queue
+
+Both jobs, **`RefreshPlatformStats`** and **`ProcessDueSubscriptions`**, run on the default queue, and the worker runs `queue:work --tries=3 --max-time=3600`. Nothing a person waits on is queued, so there is nothing for a priority split to protect; a second queue is added, with `--queue=high,default` on the worker, when the first job that needs it exists.
+
+**Scheduled work** is defined in `routes/console.php` and run by the `scheduler` container (`php artisan schedule:work`, one instance — a second would run every entry twice):
+
+| Entry | When | Runs in |
 |---|---|---|
-| `auth` | 5 / minute | IP + submitted email — slows credential stuffing without locking a real user out by IP alone |
-| `api` | 60 / minute | authenticated user id |
-| `plan` | the tenant's `api_requests_per_day` feature | tenant id, daily bucket |
+| `ProcessDueSubscriptions` | hourly | queued; the scheduler only dispatches it, the worker runs it |
+| `sanctum:prune-expired --hours=24` | daily, 00:00 UTC | the scheduler container; deletes tokens expired over a day ago (tokens expire after 7 days) |
 
-The third is the interesting one: **the rate limit is driven by the subscription plan**, so quota becomes a product feature rather than a fixed constant. It reads the same cached plan limits as everything else, and returns 429 with `Retry-After` plus the usage numbers in the body.
+All jobs are **idempotent**. A job that works on one tenant's data carries that tenant's id and sets it on `TenantContext` first — a queued job has no request to infer tenancy from, and this is precisely where a missing tenant scope would silently operate on the wrong company's data. Both built jobs are platform-wide by design: they work across every tenant with the scope removed and set no context. The worker clears the context around every job either way ([system design §3](system-design.md)).
 
-Unauthenticated routes are limited by IP. All buckets live in Redis, so limits hold across every application container rather than per-process.
+**Tenant counts are not a job.** `tenant_stats` is kept exact by the `Customer`/`User` observers in the write's own transaction (§2, [database §2](database.md)) — an O(1) primary-key `UPDATE`, never a recount.
 
-## 7. Background jobs — three priority queues
+**`RefreshPlatformStats`** (no arguments) does every aggregation behind `GET /admin/analytics`, so the endpoint only selects stored rows ([database §2](database.md)).
+- Dispatched after commit by `TenantObserver` (create, status change, delete), `CustomerObserver`/`UserObserver` (create, delete), `SubscriptionObserver` and `PlanObserver`, **30 seconds out**, `ShouldBeUniqueUntilProcessing` with one platform-wide lock (no `uniqueId`): any burst of writes across all tenants collapses into one pending refresh, and the lock is released as the job *starts*, so a write landing during a refresh queues a fresh one. `uniqueFor` = 600 s only bounds a lock whose payload was lost (e.g. a Redis flush between dispatch and run). Analytics trail a write by ~30 s plus queue wait. The lock is taken at dispatch, which is after commit, so a rolled-back write never holds it.
+- Two aggregate reads — `count(*)` and `count(*) filter (where status = 'suspended')` over `tenants` with `sum()` subqueries over `tenant_stats`; plans left-joined to `active` subscriptions, grouped and counted — then, in one transaction, saves the `platform_stats` row and writes only the `plan_stats` rows whose figures changed in **one** `upsert` (existing rows read in one query and compared in PHP — no query per plan; a plan with no subscribers gets zeros). MRR per plan is computed in PHP from the grouped counts. A changed `platform_stats` row fires `PlatformStatsObserver` `updated`; a non-empty `plan_stats` upsert fires no event, so the job drops `platform:analytics` itself after commit. An identical run writes no row and drops nothing.
+- Reads no tenant-scoped data through the scope and needs no `TenantContext` (`tenant_stats` is read with the scope removed, across every tenant by design).
 
-Jobs are dispatched to a queue deliberately; nothing is left on `default` by accident. Workers run `queue:work --queue=high,default,low`, so a long analytics job can never delay a user-facing one.
-
-| Queue | Work | Why |
-|---|---|---|
-| `high` | password reset, email verification | a person is actively blocked waiting |
-| `default` | user invitations, subscription change notifications | transactional, expected within a minute |
-| `low` | usage aggregation, dashboard precomputation, plan-change cache fan-out, expired-subscription sweep | nothing is waiting synchronously |
-
-**Scheduled work:** an hourly command transitions subscriptions past `ends_at` to `expired` (using the `(status, ends_at)` index), and a daily command rolls `feature_usage` into a new period.
-
-All jobs are **idempotent** and carry an explicit tenant id, set on `TenantContext` before touching data — a queued job has no request to infer tenancy from, and this is precisely where a missing tenant scope would silently operate on the wrong company's data.
+**`ProcessDueSubscriptions`** (no arguments, hourly) expires every canceled subscription whose `ends_at` has passed ([database §2 `subscriptions`](database.md)). There is no renewal: an uncanceled subscription has `ends_at: null` and runs until it is canceled or changed.
+- `chunkById(1000)` over `active` rows with `ends_at <= now()`; each chunk is one `update()` to `expired` by id plus one `forgetMany()`. `RefreshPlatformStats` is dispatched once, only if a row expired.
+- Idempotent: a second run finds nothing due and writes, forgets and dispatches nothing. Two overlapping runs would write the same `expired` to the same rows — harmless.
+- A tenant whose subscription expired has no live subscription: `/subscription` answers 404 and `POST /subscription` is the way back ([API §5](api.md)); user and customer creates answer 404.
+- Works across every tenant with the tenant scope removed, bound by nothing but the due condition — it sets no `TenantContext`.

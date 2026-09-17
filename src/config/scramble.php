@@ -51,7 +51,16 @@ return [
         /*
          * Description rendered on the home page of the API documentation (`/docs/api`).
          */
-        'description' => '',
+        'description' => <<<'MD'
+            Multi-tenant SaaS subscription and tenant management API. Log in with `POST /auth/login` (demo users in the README, password `password`), then paste the `access_token` into **Authorize**.
+
+            Behaviour that applies across endpoints:
+
+            - **Tenant isolation:** the tenant comes from the token, never from the request. Another tenant's id answers **404**, exactly like a missing one.
+            - **403** on tenant routes also means the tenant is suspended, or the caller is a platform admin (who has no tenant).
+            - **429 rate limits:** 60 requests a minute per user on authenticated routes, 60 a minute per IP on `/plans`, 5 a minute per email and IP on login and register (register also 10 an hour per IP). Body `{"message": "Too Many Attempts."}` with `Retry-After`.
+            - **Listings** take `page` and `per_page` (at most 100); an unknown `filter` key is a 422.
+            MD,
     ],
 
     'ui' => [
