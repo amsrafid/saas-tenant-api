@@ -14,7 +14,7 @@ Read-through `Cache::remember()` on Redis. A value with reliable invalidation ge
 | `plan:{slug}` | 24 h | `PlanRepository::findBySlug()` — the plan with its features: registration's Free plan, `GET /plans/{slug}`, the plan-limit check on user and customer create | `PlanObserver` (`created`, `updated`, `deleted`) → `PlanRepository::forget($slug)`; plus one explicit call in `PlanService::update()` (§2) |
 | `plans:active` | 24 h | `PlanRepository::active()` — every active plan with its features, `GET /plans` | the same `forget()`: it drops `plan:{slug}` and `plans:active` together, so no plan write can miss the list |
 | `tenant:{id}:subscription` | 24 h | `SubscriptionRepository::current()` — the tenant's live (`active`) subscription plus its plan's slug, for every `/subscription` endpoint, the dashboard and the plan-limit check | `SubscriptionObserver` (`created`, `updated`, `deleted`) → `SubscriptionRepository::forget($tenantId)` |
-| `platform:analytics` | 24 h | `AdminService::analytics()` — `GET /admin/analytics`, the `platform_stats` row and `plan_stats` joined to `plans`, cached as a plain array | `AdminService::forgetAnalytics()`, from `PlatformStatsObserver` (`created`, `updated`) and from `RefreshPlatformStats` after its `plan_stats` upsert (an upsert fires no event) — the only writes the figures are read from; a refresh that changes no figure clears nothing |
+| `platform:analytics` | 24 h | `AdminService::analytics()` — `GET /admin/analytics`, the `platform_stats` row and `plan_stats` joined to `plans`, cached as a plain array | `AdminService::forgetAnalytics()`, from `PlatformStatsObserver` (`created`, `updated`), from `PlanObserver` on any plan write and from `RefreshPlatformStats` after its `plan_stats` upsert (an upsert fires no event) — the only writes the figures are read from; a refresh that changes no figure clears nothing |
 
 A null result (a missing plan, a tenant with no live subscription) is stored by `remember()` but read back as a miss, so it is never served from cache.
 
@@ -30,7 +30,7 @@ Each key holds only the columns its consumers read: a tenant is `id`, `name`, `s
 
 ## 2. Invalidation — model observers, after commit
 
-**Invalidation lives in model observers, not in the services that write.** One observer per model, attached with `#[ObservedBy]`, so every write through Eloquent — a service, a seeder, `tinker`, a test factory — drops what it makes stale, and a new service cannot forget to. Every `forget()` and every dispatch runs only once the transaction commits, so a concurrent read cannot re-cache the old row between the forget and the commit, and a rolled-back write drops nothing. The `Plan`, `Subscription`, `PlatformStats` and `PlanStats` observers implement `ShouldHandleEventsAfterCommit`. The `Tenant`, `Customer` and `User` observers do not: they write `tenant_stats` **inside** the write's transaction (the zeroed row, the counter), so the count commits or rolls back with the row, and they defer their cache drops and dispatches with `DB::afterCommit()` instead.
+**Invalidation lives in model observers, not in the services that write.** One observer per model, attached with `#[ObservedBy]`, so every write through Eloquent — a service, a seeder, `tinker`, a test factory — drops what it makes stale, and a new service cannot forget to. Every `forget()` and every dispatch runs only once the transaction commits, so a concurrent read cannot re-cache the old row between the forget and the commit, and a rolled-back write drops nothing. The `Plan`, `Subscription` and `PlatformStats` observers implement `ShouldHandleEventsAfterCommit` (`plan_stats` has no observer: it is only ever upserted). The `Tenant`, `Customer` and `User` observers do not: they write `tenant_stats` **inside** the write's transaction (the zeroed row, the counter), so the count commits or rolls back with the row, and they defer their cache drops and dispatches with `DB::afterCommit()` instead.
 
 **Observers listen to `created`/`updated`/`deleted`, never `saved`.** `save()` fires `saved` even when nothing is dirty; `updated` fires only when a column actually changed. So an identical `RefreshPlatformStats` run, or a no-op `PATCH`, clears nothing (the refresh case is tested).
 
@@ -39,12 +39,12 @@ Each key holds only the columns its consumers read: a tenant is `id`, `name`, `s
 | `TenantObserver` | `created` | inserts the tenant's zeroed `tenant_stats` row in the same transaction (so the owner's increment in registration finds it); dispatches `RefreshPlatformStats` after commit |
 | | `updated` | after commit: `TenantRepository::forget($id)`; dispatches `RefreshPlatformStats` only when `status` changed |
 | | `deleted` | after commit: `TenantRepository::forget($id)`, dispatches `RefreshPlatformStats` |
-| `PlanObserver` | `created`, `updated`, `deleted` | `PlanRepository::forget($slug)`, dispatches `RefreshPlatformStats` (price, currency and billing period feed MRR; a new plan gets its `plan_stats` row from the job) |
+| `PlanObserver` | `created`, `updated`, `deleted` | `PlanRepository::forget($slug)`, `AdminService::forgetAnalytics()` (analytics lists plan names and currency, which a refresh does not rewrite for a plan without subscribers), dispatches `RefreshPlatformStats` (price, currency and billing period feed MRR; a new plan gets its `plan_stats` row from the job) |
 | `SubscriptionObserver` | `created`, `updated`, `deleted` | `SubscriptionRepository::forget($tenantId)`, dispatches `RefreshPlatformStats` |
 | `PlatformStatsObserver` | `created`, `updated` | `AdminService::forgetAnalytics()` (`plan_stats` is upserted by `RefreshPlatformStats`, which clears it itself) |
 | `CustomerObserver`, `UserObserver` | `created`, `deleted` | in the write's transaction: `tenant_stats` `customers_count`/`users_count` `+ 1` / `- 1` (one `UPDATE … SET n = n + 1` on the primary key, O(1) at any tenant size); `CustomerObserver::created` also upserts `+ 1` into the tenant's `tenant_monthly_stats` month ([database §2](database.md)); `RefreshPlatformStats` after commit (§7). A platform admin (no tenant) touches nothing |
 
-`DatabaseSeeder` no longer uses `WithoutModelEvents`, so seeding goes through the same observers.
+`DatabaseSeeder` does not use `WithoutModelEvents`, so seeding goes through the same observers.
 
 **Where an observer cannot fire, the code that writes calls `forget()` itself**, with a one-line comment saying why:
 
@@ -52,9 +52,10 @@ Each key holds only the columns its consumers read: a tenant is `id`, `name`, `s
 |---|---|---|
 | `PlanFeature::upsert()` in `PlanService` | a query-builder upsert fires no model events; a limits-only `PATCH /admin/plans/{id}` changes no plan column | `PlanService::update()` calls `PlanRepository::forget($slug)` after the transaction. `create()` needs none: the plan insert in the same transaction fires `PlanObserver` after commit |
 | The `tenant_stats` counter `increment()` in `CustomerObserver`/`UserObserver` | a query-builder increment fires no `TenantStats` event | the observer dispatches `RefreshPlatformStats` itself, inside `DB::afterCommit()` |
+| `Plan::upsert()` / `PlanFeature::upsert()` in `PlanSeeder` | a query-builder upsert fires no model events | when either upsert wrote a row, the seeder calls `PlanRepository::forgetMany()` for every seeded slug and `AdminService::forgetAnalytics()`; a re-run writes and drops nothing |
 | `DatabaseSeeder` refreshes platform stats | not a cache — the queued refresh would land after setup ends | runs `RefreshPlatformStats::handle()` in-process last; a re-run writes nothing, since an unchanged model saves no row |
 | `ProcessDueSubscriptions` expires subscriptions with a builder `update()` per `chunkById` chunk of ids | a builder update fires no `SubscriptionObserver` | the job calls `SubscriptionRepository::forgetMany()` with the chunk's tenant ids, and dispatches `RefreshPlatformStats` once at the end when anything expired |
-| A plan or tenant delete cascades to its `plan_stats` / `tenant_stats` row | a foreign-key cascade fires no model event | none needed: the `deleted` observer dispatches `RefreshPlatformStats`, whose saves drop the analytics key |
+| A plan or tenant delete cascades to its `plan_stats` / `tenant_stats` row | a foreign-key cascade fires no model event | the `deleted` observer dispatches `RefreshPlatformStats`; a tenant delete changes `platform_stats`, whose observer drops the analytics key |
 
 Any future mass `update()`/`delete()`/`insert()` on a query builder fires no events either and must call the repository `forget()` for each tenant it touches, and dispatch `RefreshPlatformStats` once. Plain token deletes (`$user->tokens()->delete()`) touch nothing cached. A plan limit enforced for a business rule is still re-checked at write time; the cache is never the last line of defence.
 
@@ -86,7 +87,7 @@ Named limiters in `AppServiceProvider`, applied with Laravel's `throttle:{name}`
 | `public` | 60 / minute | IP | `GET /plans`, `GET /plans/{slug}` — unauthenticated, and an unknown slug costs a query |
 | `api` | 60 / minute | authenticated user id (from `AuthUserService`) | every `auth:sanctum` route: `/auth/logout`, `/auth/me`, `/admin/*`, tenant routes |
 
-All buckets live in Redis (the cache store, db 1), so limits hold across every application container rather than per-process. Tests run the same limiters on the array store with `travel()` for resets.
+All buckets live in Redis (the cache store, db 1), so limits hold across every application container rather than per-process. Laravel stores each bucket under an MD5 of the limiter name and key, so no email or IP appears in a Redis key. There is no per-plan daily request quota: a plan limits users and customers only (§1, [API §6](api.md)). Tests run the same limiters on the array store with `travel()` for resets.
 
 ## 7. Background jobs — one queue
 

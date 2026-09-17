@@ -79,7 +79,7 @@ The password for every account is **`password`**.
 | `admin@globex.test` | `admin` | Globex Corporation | |
 | `member@globex.test` | `member` | Globex Corporation | |
 
-Plans: **Free** (3 users, 10 customers, 1,000 requests/day), **Pro** (10 users, 1,000 customers, 10,000 requests/day), **Enterprise** (unlimited users and customers, 100,000 requests/day).
+Plans: **Free** ($0, 3 users, 10 customers), **Pro** ($29/month, 10 users, 1,000 customers), **Enterprise** ($99/month, unlimited users and customers). A plan limits users and customers only; request rates are throttled per user, not per plan.
 
 Two tenants are seeded so you can check isolation right away. Log in as Acme and request a Globex customer id, and you get 404. Seeded customers are spread over the past 12 months, so `GET /dashboard/analytics` shows a real growth series.
 
@@ -110,7 +110,7 @@ Each point below links to the doc with the full reasoning.
 
 **Authorization.** Roles (`owner`, `admin`, `member`, `platform_admin`) are an enum, and the `Ability` enum maps each ability to the roles that hold it. Each ability becomes one Gate, applied on the route. Business rules, such as never granting a role above your own and never removing the last owner, live in the service. See [system design §5](docs/system-design.md).
 
-**Caching (Redis).** Cached: the tenant, each plan with its limits, the active plan list, the tenant's live subscription, and platform analytics. All entries last 24 hours. **Model observers invalidate them after the transaction commits**, so any write path (service, seeder, tinker) clears what it makes stale. Customers, users, usage and the tenant dashboard are deliberately not cached. See [caching §1–§4](docs/caching.md).
+**Caching (Redis).** Cached: the tenant, each plan with its limits, the active plan list, the tenant's live subscription, and platform analytics. All entries last 24 hours. **Model observers invalidate them after the transaction commits**, so any write path (service, factory, tinker) clears what it makes stale; the few query-builder writes that fire no model event clear the cache themselves. Customers, users, usage and the tenant dashboard are deliberately not cached. See [caching §1–§4](docs/caching.md).
 
 **Built for large tenants (target: millions of customers per tenant).**
 - **Counters instead of `COUNT(*)`.** `tenant_stats` holds exact user and customer counts. Observers update it inside the same transaction as the insert or delete. Plan-limit checks, usage and unfiltered listing totals read that row instead of counting the table.
@@ -119,7 +119,7 @@ Each point below links to the doc with the full reasoning.
 
 See [database](docs/database.md) §2, §5–§7.
 
-**Rate limiting.** Four named Laravel limiters, all stored in Redis:
+**Rate limiting.** Four named Laravel limiters, all stored in Redis under hashed keys (no email or IP appears in a key name):
 - login and register: per email and IP
 - register: per IP
 - public plan catalogue: per IP
@@ -205,7 +205,7 @@ These are deliberate, and each is explained in the linked doc.
 - **Platform analytics lag writes** by about 30 seconds plus queue wait. Expiry lags `ends_at` by up to an hour.
 - **Suspending a tenant does not revoke its tokens.** The middleware refuses them with 403 instead.
 - **The containers are for development only.** php-fpm runs as root inside the container, `APP_DEBUG=true`, and there is no TLS.
-- **Out of scope:** live deployment, payment capture, a permissions package, a repository for every model, and coverage targets. See [requirements §6](docs/planning/00-requirements.md).
+- **Out of scope:** live deployment, payment capture and billing (nothing renews or charges), a permissions package, a repository for every model, and coverage targets. See [system design §5–§6](docs/system-design.md) for why a permissions package and blanket repositories were left out.
 
 ## Documentation
 

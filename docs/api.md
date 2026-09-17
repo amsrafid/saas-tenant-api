@@ -1,6 +1,6 @@
 # API Design
 
-Supports submission requirement **#4**. Endpoint samples with real request/response bodies are generated from the working implementation and served as Swagger UI (§7), so documentation and code cannot drift.
+Supports submission requirement **#4**. The request and response samples in §5 were captured from the running API against the seeded demo data (ids and tokens are from that run). Swagger UI (§7) is generated from the code, so its shapes cannot drift from the implementation.
 
 Base path: `/api/v1`. Versioned from day one — an unversioned API cannot make a breaking change without breaking every client.
 
@@ -22,16 +22,16 @@ A resource returns only the fields a client acts on. Bookkeeping columns — `cr
 
 **Single resource**
 ```json
-{ "data": { "id": 12, "name": "Acme Ltd", "slug": "acme-ltd", "status": "active", "timezone": "Asia/Dhaka" } }
+{ "data": { "id": 1, "name": "Acme Corporation", "slug": "acme", "status": "active", "timezone": "Asia/Dhaka" } }
 ```
 
 **Collection** — Laravel's default paginated resource shape, present even on a single page:
 ```json
 {
-  "data": [ { "id": 1, "name": "Jane Doe", "email": "jane@acme.test", "status": "active" } ],
-  "links": { "first": "…?page=1", "last": "…?page=3", "prev": null, "next": "…?page=2" },
-  "meta": { "current_page": 1, "from": 1, "last_page": 3, "links": [ … ], "path": "…/api/v1/customers",
-            "per_page": 15, "to": 15, "total": 42 }
+  "data": [ { "id": 8, "name": "Oakridge Print House", "email": "team@oakridge-print.test", "phone": null, "status": "inactive" }, … ],
+  "links": { "first": "…?per_page=2&page=1", "last": "…?per_page=2&page=4", "prev": null, "next": "…?per_page=2&page=2" },
+  "meta": { "current_page": 1, "from": 1, "last_page": 4, "links": [ … ], "path": "http://localhost:8000/api/v1/customers",
+            "per_page": 2, "to": 2, "total": 8 }
 }
 ```
 
@@ -97,6 +97,50 @@ Every write endpoint has a Form Request. Rules are declared once and read direct
 
 Register and login both return `{ "data": { "access_token", "token_type": "Bearer", "expires_at", "user": { "id", "name", "email", "role", "status", "tenant": { "id", "name", "slug", "status", "timezone" } } } }`; `/auth/me` returns the same `user` object. Register takes `tenant_name`, `name`, `email`, `password` (8–72 characters).
 
+```http
+POST /api/v1/auth/register
+{ "tenant_name": "Initech", "name": "Peter Gibbons", "email": "peter@initech.test", "password": "password123" }
+```
+```json
+201 { "data": { "access_token": "2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758", "token_type": "Bearer",
+                "expires_at": "2026-09-24T16:35:48.000000Z",
+                "user": { "id": 9, "name": "Peter Gibbons", "email": "peter@initech.test", "role": "owner", "status": "active",
+                          "tenant": { "id": 3, "name": "Initech", "slug": "initech", "status": "active", "timezone": "Asia/Dhaka" } } } }
+```
+```http
+POST /api/v1/auth/login
+{ "email": "owner@acme.test", "password": "password" }
+```
+```json
+200 { "data": { "access_token": "1|yI7BF0ilTsMVsXzflYzDQsp9PvouFdYBEVmbEnYOf1bb7b8d", "token_type": "Bearer",
+                "expires_at": "2026-09-24T16:35:47.000000Z",
+                "user": { "id": 2, "name": "Acme Owner", "email": "owner@acme.test", "role": "owner", "status": "active",
+                          "tenant": { "id": 1, "name": "Acme Corporation", "slug": "acme", "status": "active", "timezone": "Asia/Dhaka" } } } }
+```
+```http
+POST /api/v1/auth/login
+{ "email": "owner@acme.test", "password": "wrong" }
+```
+```json
+422 { "message": "These credentials do not match our records.",
+      "errors": { "email": [ "These credentials do not match our records." ] } }
+```
+```http
+GET /api/v1/auth/me
+Authorization: Bearer 2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758
+```
+```json
+200 { "data": { "id": 9, "name": "Peter Gibbons", "email": "peter@initech.test", "role": "owner", "status": "active",
+                "tenant": { "id": 3, "name": "Initech", "slug": "initech", "status": "active", "timezone": "Asia/Dhaka" } } }
+```
+```http
+POST /api/v1/auth/logout
+Authorization: Bearer 2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758
+```
+```json
+204 (no body); the same token on GET /auth/me then gets 401 { "message": "Unauthenticated." }
+```
+
 ### Tenant (current company)
 | Method | Path | Role |
 |---|---|---|
@@ -125,7 +169,7 @@ PATCH /api/v1/tenant
 | PATCH | `/users/{id}` | owner, admin | partial; role rules below |
 | DELETE | `/users/{id}` | owner | hard delete, 204; revokes the user's tokens |
 
-Fixed at `S1-11`:
+Details:
 - **Body:** POST takes `name`, `email` (trimmed and lower-cased, **unique across all tenants** — it is the login), `password` (8–72), `role` (`owner`/`admin`/`member`); new users are `active`. PATCH accepts any subset of `name`, `email`, `role`, `status` (`active`/`disabled`); no password change.
 - **Response:** the `user` object of `/auth/me` without `tenant`: `{ "data": { "id", "name", "email", "role", "status" } }`.
 - **Role rules**, checked in `UserService` after the ability gate:
@@ -134,6 +178,89 @@ Fixed at `S1-11`:
   3. You cannot change your own role → 403.
   4. The last active owner cannot be deleted, demoted or disabled → 409. This is checked before rule 3, so a sole owner demoting themselves learns why.
 - **Disabling or deleting a user deletes their tokens**, so access ends on the next request. A role change keeps them: gates read the role on every request.
+
+Samples below run as `owner@acme.test` unless the heading says otherwise. Error bodies are shown without the stack trace the local `APP_DEBUG=true` adds.
+
+```http
+GET /api/v1/users?per_page=2
+```
+```json
+200 { "data": [ { "id": 5, "name": "Acme Member Two", "email": "member2@acme.test", "role": "member", "status": "active" },
+                { "id": 4, "name": "Acme Member One", "email": "member1@acme.test", "role": "member", "status": "active" } ],
+      "links": { "first": "http://localhost:8000/api/v1/users?per_page=2&page=1", "last": "http://localhost:8000/api/v1/users?per_page=2&page=2",
+                 "prev": null, "next": "http://localhost:8000/api/v1/users?per_page=2&page=2" },
+      "meta": { "current_page": 1, "from": 1, "last_page": 2,
+                "links": [ { "url": null, "label": "&laquo; Previous", "page": null, "active": false },
+                           { "url": "http://localhost:8000/api/v1/users?per_page=2&page=1", "label": "1", "page": 1, "active": true }, … ],
+                "path": "http://localhost:8000/api/v1/users", "per_page": 2, "to": 2, "total": 4 } }
+```
+```http
+GET /api/v1/users?filter[role]=member&search=acme&per_page=2
+```
+```json
+200 { "data": [ { "id": 5, "name": "Acme Member Two", … }, { "id": 4, "name": "Acme Member One", … } ],
+      "links": { "first": "http://localhost:8000/api/v1/users?filter%5Brole%5D=member&search=acme&per_page=2&page=1", …, "next": null },
+      "meta": { "current_page": 1, "last_page": 1, "per_page": 2, "total": 2, … } }
+```
+```http
+POST /api/v1/users
+{ "name": "Jane Cooper", "email": "Jane.Cooper@acme.test", "password": "password123", "role": "member" }
+```
+```json
+201 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "member", "status": "active" } }
+```
+```http
+GET /api/v1/users/10
+```
+```json
+200 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "member", "status": "active" } }
+```
+```http
+PATCH /api/v1/users/10
+{ "role": "admin", "status": "disabled" }
+```
+```json
+200 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "admin", "status": "disabled" } }
+```
+```http
+DELETE /api/v1/users/10
+```
+```json
+204 (no body)
+```
+```http
+GET /api/v1/users/6    (a Globex user)
+```
+```json
+404 { "message": "No query results for model [App\\Models\\User] 6" }
+```
+Role rules, as `admin@acme.test` (user 2 is the owner, user 3 the admin itself):
+```http
+POST /api/v1/users          { "name": "New Owner", "email": "new.owner@acme.test", "password": "password123", "role": "owner" }
+PATCH /api/v1/users/2       { "status": "disabled" }
+PATCH /api/v1/users/3       { "role": "member" }
+```
+```json
+403 { "message": "You cannot grant a role above your own." }
+403 { "message": "You cannot modify a user whose role is above your own." }
+403 { "message": "You cannot change your own role." }
+```
+As `owner@acme.test`, the only owner:
+```http
+PATCH /api/v1/users/2    { "role": "admin" }
+DELETE /api/v1/users/2
+```
+```json
+409 { "message": "The tenant must keep at least one active owner." }
+```
+Plan limit, as `owner@globex.test` (Free plan, 3 of 3 users):
+```http
+POST /api/v1/users
+{ "name": "Extra", "email": "extra@globex.test", "password": "secret123", "role": "member" }
+```
+```json
+429 { "message": "The plan's max_users limit of 3 has been reached.", "feature": "max_users", "limit": 3, "used": 3 }
+```
 
 ### Customers
 | Method | Path | Role | Notes |
@@ -144,12 +271,78 @@ Fixed at `S1-11`:
 | PATCH | `/customers/{id}` | any member | partial; 404 across tenants |
 | DELETE | `/customers/{id}` | owner, admin | hard delete, 204; 404 across tenants |
 
-Fixed at `S1-10`:
+Details:
 - **Members create and edit customers; only owners and admins delete them.** Customers are day-to-day working records, so every staff member maintains them; deletion is permanent (no soft deletes), so it is held back from `member`.
 - **Body:** `name` (required, ≤255), `email` (required, trimmed and lower-cased, **unique within the tenant** — the same email at another tenant is allowed), `phone` (≤32, nullable), `status` (`active`/`inactive`, defaults to `active`). PATCH accepts any subset.
 - **Response:** `{ "data": { "id", "name", "email", "phone", "status" } }` — one shape for the listing and a single customer.
 - **Authorization runs before validation**, so a caller without the ability gets 403 whatever the body.
 - **Flow:** route (`->can(Ability::X)`, `{id}` numeric only) → controller → Form Request → `CustomerService` → `CustomerResource`. `CustomerService::find()` is a `findOrFail` through the tenant scope, so another tenant's id is a 404 like a missing one. A non-numeric id does not match the route (404).
+
+```http
+GET /api/v1/customers?per_page=2
+```
+```json
+200 { "data": [ { "id": 8, "name": "Oakridge Print House", "email": "team@oakridge-print.test", "phone": null, "status": "inactive" },
+                { "id": 7, "name": "Silver Pine Hotel", "email": "frontdesk@silverpine.test", "phone": null, "status": "active" } ],
+      "links": { "first": "http://localhost:8000/api/v1/customers?per_page=2&page=1", "last": "http://localhost:8000/api/v1/customers?per_page=2&page=4",
+                 "prev": null, "next": "http://localhost:8000/api/v1/customers?per_page=2&page=2" },
+      "meta": { "current_page": 1, "from": 1, "last_page": 4, "links": [ … ], "path": "http://localhost:8000/api/v1/customers",
+                "per_page": 2, "to": 2, "total": 8 } }
+```
+```http
+GET /api/v1/customers?filter[status]=inactive&search=o&per_page=2
+```
+```json
+200 { "data": [ { "id": 8, "name": "Oakridge Print House", "email": "team@oakridge-print.test", "phone": null, "status": "inactive" } ],
+      "links": { …, "next": null }, "meta": { "current_page": 1, "last_page": 1, "per_page": 2, "to": 1, "total": 1, … } }
+```
+```http
+POST /api/v1/customers
+{ "name": "Northwind Traders", "email": "Sales@Northwind.test", "phone": "+8801711000000" }
+```
+```json
+201 { "data": { "id": 15, "name": "Northwind Traders", "email": "sales@northwind.test", "phone": "+8801711000000", "status": "active" } }
+```
+```http
+GET /api/v1/customers/15
+```
+```json
+200 { "data": { "id": 15, "name": "Northwind Traders", "email": "sales@northwind.test", "phone": "+8801711000000", "status": "active" } }
+```
+```http
+PATCH /api/v1/customers/15
+{ "status": "inactive", "phone": null }
+```
+```json
+200 { "data": { "id": 15, "name": "Northwind Traders", "email": "sales@northwind.test", "phone": null, "status": "inactive" } }
+```
+```http
+POST /api/v1/customers
+{ "name": "Dup", "email": "sales@northwind.test" }
+```
+```json
+422 { "message": "The email has already been taken.", "errors": { "email": [ "The email has already been taken." ] } }
+```
+```http
+DELETE /api/v1/customers/15
+```
+```json
+204 (no body)
+```
+```http
+GET /api/v1/customers/9    (a Globex customer, requested as Acme)
+```
+```json
+404 { "message": "No query results for model [App\\Models\\Customer] 9" }
+```
+Plan limit, as `owner@globex.test` (Free plan, 10 of 10 customers):
+```http
+POST /api/v1/customers
+{ "name": "Pinecrest Farms", "email": "hello@pinecrest-farms.test" }
+```
+```json
+429 { "message": "The plan's max_customers limit of 10 has been reached.", "feature": "max_customers", "limit": 10, "used": 10 }
+```
 
 ### Plans
 | Method | Path | Auth | Notes |
@@ -160,7 +353,7 @@ Fixed at `S1-10`:
 | PATCH | `/admin/plans/{id}` | platform_admin | partial, feature limits included |
 | DELETE | `/admin/plans/{id}` | platform_admin | 204; a plan any subscription refers to → 409 |
 
-Fixed at `S1-12`:
+Details:
 - **Body:** POST takes `name` (≤255), `slug` (lower-case letters, digits and single hyphens, unique), `price_cents` (integer ≥ 0, minor units), `currency` (three upper-case letters), `billing_period` (`monthly`/`yearly`), `is_active` (default `true`), `sort_order` (0–32767, default `0`) and `features` — an object with **every** feature key (`max_users`, `max_customers`), each an integer ≥ 0 or `null` for unlimited. PATCH accepts any subset of those except `slug`, which is fixed once created; `features` may carry only the limits that change.
 - **Response:** `{ "data": { "id", "name", "slug", "price_cents", "currency", "billing_period", "is_active", "features": { "max_users": 3, "max_customers": 10 } } }` — one shape for the listing, a single plan and the admin writes.
 - **Deleting** a plan is refused with 409 while any subscription row refers to it — a canceled or expired one included, because the foreign key restricts on every row and plan history must survive. Deactivate it instead (`is_active: false`): it leaves the listing and stays readable by slug, and existing subscriptions are untouched.
@@ -186,7 +379,7 @@ POST /api/v1/admin/plans
 | DELETE | `/subscription` | owner | cancel; runs to the end of the current billing period (set as `ends_at`) rather than terminating immediately; 200 with the subscription |
 | GET | `/subscription/usage` | any member | per-feature `used` / `limit` / `remaining`, `null` limit = unlimited |
 
-Fixed at `S1-13`:
+Details:
 - **Body:** POST and PATCH take `plan` — the slug of an **active** plan. An unknown or inactive slug is a 422 on `plan` (`The selected plan is invalid.`). Unknown fields are a 422 as everywhere else.
 - **Response:** `{ "data": { "id", "status", "starts_at", "ends_at", "canceled_at", "plan": { …the plan object of /plans, features included… } } }` for GET, POST (201), PATCH (200) and DELETE (200). The limits are the plan's `features`. `ends_at` is `null` while the subscription runs uncanceled; it is set only by cancelling or changing plan.
 - **Only the live subscription is addressed** — the tenant's one `active` row. With none (it expired), GET, PATCH, DELETE and usage are 404, and POST is the way back in; POST while one is live is 409.
@@ -200,7 +393,7 @@ Fixed at `S1-13`:
 GET /api/v1/subscription
 ```
 ```json
-200 { "data": { "id": 1, "status": "active", "starts_at": "2026-06-16T10:00:00.000000Z", "ends_at": null, "canceled_at": null,
+200 { "data": { "id": 1, "status": "active", "starts_at": "2026-09-17T16:35:38.000000Z", "ends_at": null, "canceled_at": null,
                 "plan": { "id": 2, "name": "Pro", "slug": "pro", "price_cents": 2900, "currency": "USD", "billing_period": "monthly",
                           "is_active": true, "features": { "max_users": 10, "max_customers": 1000 } } } }
 ```
@@ -208,8 +401,8 @@ GET /api/v1/subscription
 DELETE /api/v1/subscription
 ```
 ```json
-200 { "data": { "id": 1, "status": "active", "starts_at": "2026-06-16T10:00:00.000000Z", "ends_at": "2026-10-16T10:00:00.000000Z",
-                "canceled_at": "2026-09-18T12:00:00.000000Z", "plan": { …as above… } } }
+200 { "data": { "id": 1, "status": "active", "starts_at": "2026-09-17T16:35:38.000000Z", "ends_at": "2026-10-17T16:35:38.000000Z",
+                "canceled_at": "2026-09-17T16:38:12.000000Z", "plan": { …as above… } } }
 ```
 ```http
 PATCH /api/v1/subscription
@@ -232,7 +425,7 @@ GET /api/v1/subscription/usage
 |---|---|---|---|
 | GET | `/dashboard/analytics` | any member | the live plan, usage per feature (users and customers against the limits), customers added in each of the last 12 months; read from stored counters, not cached |
 
-Fixed at `S2-05`:
+Details:
 - **Authorization:** ability `dashboard:view`, held by owner, admin and member; a platform admin gets 403 from the tenant middleware.
 - **Response:** `plan` (`id`, `name`, `slug`); `usage` — the same object as `GET /subscription/usage`, so the user and customer totals (every status) are its `used` values and the ratio is `used`/`limit`; `customer_growth` — twelve `{ month, customers_added }` entries, oldest first, ending with the current month. **Months are the tenant's** (`tenants.timezone`): a customer created at 23:30 UTC on 30 September belongs to October for an `Asia/Dhaka` tenant. A month nobody was added in reads `0`.
 - **Growth counts additions.** A deleted customer stays in the month it was added; the current total is `usage.max_customers.used`.
@@ -260,7 +453,7 @@ GET /api/v1/dashboard/analytics    (Acme, seeded)
 | PATCH | `/admin/tenants/{id}` | body `status` (`active`/`suspended`) only; 200 with the same shape as the listing; unknown id → 404 |
 | GET | `/admin/analytics` | platform-wide totals, and each plan's live tenants and MRR in cents; read from job-maintained summary tables, cached 24 h |
 
-Fixed at `S1-15`:
+Details:
 - **Authorization:** `auth:sanctum` without the `tenant` middleware; abilities `tenants:manage` (both tenant routes) and `platform-analytics:view`, held by `platform_admin` only. A tenant user of any role gets 403 before validation.
 - **No tenant-owned model is queried through its scope here.** `Tenant` and `Plan` are not tenant-scoped; the counts come from the `tenant_stats` table joined by name.
 - **Plan** is the live (`active`) subscription's plan, joined — at most one row per tenant because the join repeats the partial unique index's predicate, so `meta.total` stays exact. `null` when the tenant has no live subscription. `filter[plan_id]` filters on that join.
@@ -303,14 +496,7 @@ GET /api/v1/admin/analytics
 - The check runs after validation, and for users after the role rule (a 403 wins over a 429). Nothing is written on a 429.
 - **No `Retry-After`.** A count limit does not reset with time — only an upgrade or a delete frees a slot — so there is no honest value to send.
 - **No live subscription** (a canceled subscription expired): the create answers 404, like every `/subscription` endpoint.
-
-```
-POST /api/v1/users    (Globex, Free plan, 3 of 3 users)
-{ "name": "Extra", "email": "extra@globex.test", "password": "secret123", "role": "member" }
-
-429 { "message": "The plan's max_users limit of 3 has been reached.",
-      "feature": "max_users", "limit": 3, "used": 3 }
-```
+- Samples of both 429 bodies are under Users and Customers in §5.
 
 ## 7. API documentation tooling — Scramble, not L5-Swagger
 
@@ -339,10 +525,10 @@ Scramble ships its own UI (Stoplight Elements / Scalar). That is replaced: Swagg
 
 **Where hand-written text is still needed.** Scramble infers structure, not intent. Short one- or two-line docblock descriptions on controller methods become endpoint summaries, and the non-obvious behaviours — the 429 on a plan limit, the 422 on a downgrade below usage, 404-not-403 for cross-tenant — are documented explicitly rather than inferred. That prose belongs in the README's API section, not in annotations.
 
-Fixed at `S2-08` — the few places Scramble cannot see, filled with one line each rather than annotation blocks:
+The few places Scramble cannot see, filled with one line each rather than annotation blocks:
 - **Array responses** (`/subscription/usage`, `/dashboard/analytics`, `/admin/analytics`) return `JsonResource::make($array)`, which Scramble cannot look inside: an `@response array{data: …}` tag on the controller method gives the shape.
 - **Computed resource fields** (a plan's `features` object, the admin tenant listing's joined `plan` and `usage`): an `@var array{…}` above the array item.
 - **Errors thrown inside a service** (`abort_if` 409s, the plan-limit 429 on `POST /users` and `POST /customers`) are not propagated to the controller's operation: a `#[Response(status, description, type)]` attribute on the controller method.
 - **Cross-endpoint behaviour** (throttle 429s, 403 for a suspended tenant, 404 across tenants) is stated once in the spec's description (`config/scramble.php` `info.description`), shown at the top of Swagger UI, rather than repeated on ~30 operations.
 
-**Risk, stated plainly.** Scramble is pre-1.0 (v0.13.x as of Aug 2026). Its Laravel 13 support was verified at install time in `S1-02`: **0.13.43 resolves against Laravel 13.32 and generates an OpenAPI 3.1 spec, so the fallback was not needed.** Had it failed, the fallback was a **hand-written `openapi.yaml`** served through the same Swagger UI — roughly an extra hour, still Swagger, still no annotations in the controllers, but it must be kept in step with the code by hand. L5-Swagger remains rejected either way, for the reasons above. The decision is reversible at that point and nowhere later.
+**Risk, stated plainly.** Scramble is pre-1.0 (v0.13.x as of Aug 2026). Its Laravel 13 support was verified at install time: **0.13.43 resolves against Laravel 13.32 and generates an OpenAPI 3.1 spec, so the fallback was not needed.** Had it failed, the fallback was a **hand-written `openapi.yaml`** served through the same Swagger UI — roughly an extra hour, still Swagger, still no annotations in the controllers, but it must be kept in step with the code by hand. L5-Swagger remains rejected either way, for the reasons above. The decision is reversible at that point and nowhere later.
