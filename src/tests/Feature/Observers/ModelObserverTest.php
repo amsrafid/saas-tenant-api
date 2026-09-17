@@ -213,6 +213,7 @@ describe('cache invalidation', function () {
         expectWriteDropsAnalytics($write);
     })->with([
         'platform stats' => [fn () => PlatformStats::select(['id', 'users_count'])->sole()->forceFill(['users_count' => 99])->save()],
+        'plan renamed' => [fn () => Plan::select(['id', 'name', 'slug'])->firstOrFail()->forceFill(['name' => 'Renamed'])->save()],
         'refresh that changes a plan figure' => [function () {
             DB::table('plan_stats')->update(['mrr_cents' => 99]);
             RefreshPlatformStats::dispatchSync();
