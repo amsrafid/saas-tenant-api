@@ -1,12 +1,5 @@
 name: saas-tenant-api
 
-# Database credentials live only here. Laravel reads them from the container environment,
-# which takes precedence over src/.env, so the two can never disagree.
-x-database-credentials: &database-credentials
-  DB_DATABASE: ${DB_DATABASE:-saas}
-  DB_USERNAME: ${DB_USERNAME:-saas}
-  DB_PASSWORD: ${DB_PASSWORD:-secret}
-
 services:
   app:
     container_name: saas-app
@@ -14,7 +7,6 @@ services:
       context: .
       dockerfile: docker/php/Dockerfile
     restart: unless-stopped
-    environment: *database-credentials
     volumes:
       - ./src:/var/www
     depends_on:
@@ -45,15 +37,29 @@ services:
       context: .
       dockerfile: docker/php/Dockerfile
     restart: unless-stopped
-    command: php artisan queue:work --queue=high,default,low --tries=3 --max-time=3600
-    environment: *database-credentials
+    command: php artisan queue:work --tries=3 --max-time=3600
     volumes:
       - ./src:/var/www
     depends_on:
       app:
         condition: service_healthy
 
-  # One-shot: installs dependencies, migrates, and seeds a new database, then exits.
+  # Runs the schedule in routes/console.php every minute; queued entries are executed by the worker.
+  # A single instance: a second scheduler would run every entry twice.
+  scheduler:
+    container_name: saas-scheduler
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: unless-stopped
+    command: php artisan schedule:work
+    volumes:
+      - ./src:/var/www
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # One-shot: installs dependencies, migrates, and seeds idempotently, then exits.
   # Invoked via sh so it runs regardless of the file's executable bit on Windows checkouts.
   setup:
     build:
@@ -62,7 +68,6 @@ services:
     restart: "no"
     command: ["sh", "/usr/local/bin/setup.sh"]
     environment:
-      <<: *database-credentials
       APP_PORT: ${APP_PORT:-8000}
     volumes:
       - ./src:/var/www
@@ -79,15 +84,26 @@ services:
     restart: unless-stopped
     environment:
       TZ: UTC
-      POSTGRES_DB: ${DB_DATABASE:-saas}
-      POSTGRES_USER: ${DB_USERNAME:-saas}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    # Credentials come from src/.env (falling back to .env.example before setup has created it).
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -a
+        eval "$$(grep -h '^DB_' /laravel/.env.example /laravel/.env 2>/dev/null)"
+        POSTGRES_DB=$$DB_DATABASE POSTGRES_USER=$$DB_USERNAME POSTGRES_PASSWORD=$$DB_PASSWORD
+        exec docker-entrypoint.sh postgres
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./src:/laravel:ro
       # Runs only when the volume is first initialised; Pest runs against this database, never the seeded one.
       - ./docker/postgres/create-testing-database.sh:/docker-entrypoint-initdb.d/create-testing-database.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      test:
+        - CMD-SHELL
+        - eval "$$(grep -h '^DB_' /laravel/.env.example /laravel/.env 2>/dev/null)" && pg_isready -h 127.0.0.1 -U "$$DB_USERNAME" -d "$$DB_DATABASE"
       interval: 5s
       timeout: 3s
       retries: 10
