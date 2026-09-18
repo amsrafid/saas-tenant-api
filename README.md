@@ -4,20 +4,6 @@ A multi-tenant REST API for companies (tenants), their staff users and roles, cu
 
 Laravel 13 · PHP 8.4 · PostgreSQL 16 · Redis 7 · Sanctum · Pest · Docker Compose
 
-## Contents
-
-- [Prerequisites](#prerequisites)
-- [Setup](#setup)
-- [URLs](#urls)
-- [Demo accounts](#demo-accounts)
-- [Using Swagger UI](#using-swagger-ui)
-- [Architecture](#architecture)
-- [API behaviour worth knowing](#api-behaviour-worth-knowing)
-- [Tests and formatting](#tests-and-formatting)
-- [Day-to-day commands](#day-to-day-commands)
-- [Known limits and trade-offs](#known-limits-and-trade-offs)
-- [Documentation](#documentation)
-
 ## Prerequisites
 
 - **Docker** with **Compose v2** (the `docker compose` command, bundled with Docker Desktop). Tested with Compose 2.21. The legacy `docker-compose` v1 is not supported.
@@ -85,11 +71,7 @@ Two tenants are seeded so you can check isolation right away. Log in as Acme and
 
 ## Using Swagger UI
 
-1. Open http://localhost:8000/api/documentation.
-2. Under **Auth**, open `POST /auth/login`, click **Try it out**, and send `{"email": "owner@acme.test", "password": "password"}`.
-3. Copy `data.access_token` from the response (the full string, including the `1|` prefix).
-4. Click **Authorize** at the top, paste the token (no `Bearer ` prefix), and click **Authorize**. The token is kept across page reloads.
-5. Every other endpoint now runs as that user. `POST /auth/logout` revokes the token.
+Open http://localhost:8000/api/documentation, send `POST /auth/login` with `{"email": "owner@acme.test", "password": "password"}`, and copy `data.access_token` (the full string, including the `1|` prefix). Click **Authorize** at the top, paste the token without a `Bearer ` prefix, and every other endpoint runs as that user until `POST /auth/logout`.
 
 The same flow with curl:
 
@@ -102,40 +84,23 @@ curl -s http://localhost:8000/api/v1/customers -H 'Authorization: Bearer <access
 
 ## Architecture
 
-Each point below links to the doc with the full reasoning.
+**Request path.** Route (`auth:sanctum` → `tenant` middleware → `throttle` → `can:<ability>`) → Controller → Form Request → Service → API Resource. One service per domain in `app/Services`; repositories only for cache-backed reads (tenant, plan, live subscription). No per-resource Policy, Action or DTO classes. See [system design §6](docs/system-design.md).
 
-**Request path.** Route (`auth:sanctum` → `tenant` middleware → `throttle` → `can:<ability>`) → Controller → Form Request → Service → API Resource. One service per domain in `app/Services`. Repositories exist only for cache-backed reads (tenant, plan, live subscription). No per-resource Policy, Action or DTO classes. See [system design §6](docs/system-design.md).
+**Multi-tenancy.** One database, shared schema, a `tenant_id` column on every tenant-owned table. The `ResolveTenant` middleware takes the tenant from the token's user, never from the request, and stores it in the `TenantContext` singleton; a global scope filters every tenant-owned model, so a controller that forgets a `where` still cannot read another tenant's rows. The context is cleared after every request and every queued job, because a long-lived worker would otherwise carry one job's tenant into the next. See [system design §2–§3](docs/system-design.md).
 
-**Multi-tenancy.** One database, shared schema, a `tenant_id` column on every tenant-owned table. The `ResolveTenant` middleware gets the tenant from the token's user (never from the request) and stores it in the `TenantContext` singleton. A global scope on every tenant-owned model filters by that tenant, so a controller that forgets a `where` still cannot read another tenant's rows. The context is cleared after every request and every queued job, because a long-lived worker would otherwise carry one job's tenant into the next. See [system design §2–§3](docs/system-design.md).
+**Authorization.** Roles (`owner`, `admin`, `member`, `platform_admin`) are an enum, and the `Ability` enum maps each ability to the roles that hold it. Each ability becomes one Gate, applied on the route. Business rules — never granting a role above your own, never removing the last owner — live in the service. See [system design §5](docs/system-design.md).
 
-**Authorization.** Roles (`owner`, `admin`, `member`, `platform_admin`) are an enum, and the `Ability` enum maps each ability to the roles that hold it. Each ability becomes one Gate, applied on the route. Business rules, such as never granting a role above your own and never removing the last owner, live in the service. See [system design §5](docs/system-design.md).
+**Caching (Redis).** Cached for 24 hours: the tenant, each plan with its limits, the active plan list, the tenant's live subscription, and platform analytics. **Model observers invalidate them after the transaction commits**, so any write path (service, factory, tinker) clears what it makes stale; the few query-builder writes that fire no model event clear the cache themselves. Customers, users, usage and the tenant dashboard are deliberately not cached. See [caching §1–§4](docs/caching.md).
 
-**Caching (Redis).** Cached: the tenant, each plan with its limits, the active plan list, the tenant's live subscription, and platform analytics. All entries last 24 hours. **Model observers invalidate them after the transaction commits**, so any write path (service, factory, tinker) clears what it makes stale; the few query-builder writes that fire no model event clear the cache themselves. Customers, users, usage and the tenant dashboard are deliberately not cached. See [caching §1–§4](docs/caching.md).
+**Built for large tenants (target: millions of customers per tenant).** `tenant_stats` holds exact user and customer counts, updated by observers inside the same transaction as the insert or delete, so plan-limit checks, usage and unfiltered listing totals never run `COUNT(*)`. `tenant_monthly_stats` stores customers added per month, and `platform_stats` / `plan_stats` are refreshed by a queued job, so no analytics request runs an aggregate. Indexes lead with `tenant_id` and end in the listing order. See [database §2, §5–§7](docs/database.md).
 
-**Built for large tenants (target: millions of customers per tenant).**
-- **Counters instead of `COUNT(*)`.** `tenant_stats` holds exact user and customer counts. Observers update it inside the same transaction as the insert or delete. Plan-limit checks, usage and unfiltered listing totals read that row instead of counting the table.
-- **Precomputed analytics.** `tenant_monthly_stats` stores customers added per month. `platform_stats` and `plan_stats` are refreshed by a queued job, so no analytics request runs an aggregate query.
-- **Indexes match the real queries.** They lead with `tenant_id` and cover the two Postgres traps (foreign keys are not auto-indexed; a composite index does not serve its second column alone).
+**Rate limiting.** Four named Laravel limiters, stored in Redis under hashed keys (no email or IP appears in a key name): login and register per email and IP, register per IP, the public plan catalogue per IP, every authenticated route per user. See [caching §6](docs/caching.md).
 
-See [database](docs/database.md) §2, §5–§7.
-
-**Rate limiting.** Four named Laravel limiters, all stored in Redis under hashed keys (no email or IP appears in a key name):
-- login and register: per email and IP
-- register: per IP
-- public plan catalogue: per IP
-- every authenticated route: per user
-
-See [caching §6](docs/caching.md).
-
-**Background jobs and the scheduler.** Both jobs run on the default queue:
-- `RefreshPlatformStats` is debounced and unique across the platform. It rebuilds platform analytics about 30 seconds after a write.
-- `ProcessDueSubscriptions` runs hourly. It expires canceled subscriptions once `ends_at` passes. Nothing renews: there is no billing.
-
-See [caching §7](docs/caching.md).
+**Background jobs and the scheduler.** Both jobs run on the default queue. `RefreshPlatformStats` is debounced and unique across the platform, rebuilding platform analytics about 30 seconds after a write. `ProcessDueSubscriptions` runs hourly and expires canceled subscriptions once `ends_at` passes; nothing renews, because there is no billing. See [caching §7](docs/caching.md).
 
 ## API behaviour worth knowing
 
-Swagger shows every endpoint's request and response shapes. The spec's own description, at the top of Swagger UI, repeats the rules that apply across endpoints. The behaviours below cannot be inferred from the shapes alone. Full samples are in [docs/api.md](docs/api.md).
+Swagger shows every endpoint's request and response shapes; the behaviours below cannot be inferred from the shapes alone. Full samples are in [docs/api.md](docs/api.md).
 
 | Situation | Response |
 |---|---|
@@ -166,16 +131,9 @@ docker compose exec app php artisan test                 # Pest suite, against t
 docker compose exec app ./vendor/bin/pint --test         # Laravel Pint, check only (drop --test to fix)
 ```
 
-The suite covers:
-- tenant isolation: cross-tenant 404s, scope failures when no tenant is set, and context reset between queued jobs
-- role rules
-- plan limits and the locked counter
-- the downgrade refusal
-- rate limits
-- observer-based cache invalidation and counters
-- the expiry sweep
-- analytics
-- exact query counts on listing and dashboard endpoints (N+1 guards)
+The suite covers tenant isolation (cross-tenant 404s, scope failure when no tenant is set, context reset between queued jobs), role rules, plan limits and the locked counter, the downgrade refusal, rate limits, observer-based cache invalidation and counters, the expiry sweep, analytics, and exact query counts on listing and dashboard endpoints as N+1 guards.
+
+Both commands also run on GitHub Actions for every push to `master` and every pull request ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), against a Postgres 16 and a Redis 7 service container.
 
 ## Day-to-day commands
 
@@ -196,8 +154,6 @@ The suite covers:
 | Wipe everything (all volumes, the test database included) and start again | `docker compose down -v` then `docker compose up -d` |
 
 ## Known limits and trade-offs
-
-These are deliberate, and each is explained in the linked doc.
 
 - **Listing pagination uses `OFFSET`.** A filtered or searched listing also runs `COUNT(*)` for `meta.total`. Unfiltered totals come from `tenant_stats`. The next step would be keyset pagination. See [database §7](docs/database.md).
 - **Search is a case-insensitive prefix match** (`lower(col) LIKE 'term%'`), not substring search, which would need `pg_trgm`. See [database §5](docs/database.md).
