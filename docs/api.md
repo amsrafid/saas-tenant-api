@@ -1,8 +1,8 @@
 # API Design
 
-Supports submission requirement **#4**. The request and response samples in §5 were captured from the running API against the seeded demo data (ids and tokens are from that run). Swagger UI (§7) is generated from the code, so its shapes cannot drift from the implementation.
+Covers submission requirement **#4**. The samples in §5 are real: they were captured from the running API against the seeded demo data.
 
-Base path: `/api/v1`. Versioned from day one — an unversioned API cannot make a breaking change without breaking every client.
+Base path: `/api/v1`. Versioned from the start, so a breaking change can ship without breaking every client.
 
 ---
 
@@ -10,15 +10,15 @@ Base path: `/api/v1`. Versioned from day one — an unversioned API cannot make 
 
 - **Auth:** `Authorization: Bearer <sanctum-token>` on everything except `POST /auth/register`, `POST /auth/login`, `GET /plans` and `GET /plans/{slug}`.
 - **Content:** JSON in, JSON out. `Accept: application/json` is enforced so Laravel never returns an HTML error page to an API client.
-- **Naming:** plural nouns for collections, `snake_case` field names, ISO-8601 UTC timestamps (`2026-09-19T11:30:00.000000Z`, Laravel's default date serialisation).
+- **Naming:** plural nouns for collections, `snake_case` field names, ISO-8601 UTC timestamps.
 - **Verbs:** `GET` read, `POST` create, `PATCH` partial update (not `PUT` — every update here is partial), `DELETE` remove.
-- **No `tenant_id` anywhere in a request.** It is derived from the authenticated token. A client cannot address another tenant even by trying.
+- **No `tenant_id` anywhere in a request.** It is derived from the authenticated token, so a client cannot address another tenant even by trying.
 
 ## 2. Response envelope
 
-Every successful response is a plain Laravel API Resource (`JsonResource`) — a controller never returns a raw model or array. Dates are the model's Carbon attributes, which Laravel serialises as ISO-8601 in UTC.
+Every response goes through an API Resource; a controller never returns a raw model.
 
-A resource returns only the fields a client acts on. Bookkeeping columns — `created_at`, `updated_at`, a plan's `sort_order` — are not returned, and the query behind the response does not select them; a timestamp appears only when it carries domain meaning (a subscription's `starts_at`, `ends_at`, `canceled_at`).
+A resource returns only the fields a client uses. `created_at`, `updated_at` and a plan's `sort_order` are not returned, and the query does not even select them. A date appears only when it means something — a subscription's `starts_at`, `ends_at`, `canceled_at`.
 
 **Single resource**
 ```json
@@ -35,7 +35,7 @@ A resource returns only the fields a client acts on. Bookkeeping columns — `cr
 }
 ```
 
-**Error** — Laravel's own JSON error rendering, switched on for every `api/*` route (`shouldRenderJsonWhen` in `bootstrap/app.php`). Every error has `message`; a 422 also has `errors` keyed by field:
+**Error** — Laravel's own JSON error rendering, switched on for every `api/*` route. Every error has `message`; a 422 also has `errors` keyed by field:
 ```json
 {
   "message": "The email has already been taken.",
@@ -56,13 +56,13 @@ With `APP_DEBUG=false` (production) no stack trace or SQL is included; a 5xx say
 | 422 | validation failure |
 | 429 | rate limit, or a plan's user/customer limit reached (§6) |
 
-**Rate limits** ([caching §6](caching.md)): every authenticated route 60 requests/minute per user; `GET /plans*` 60/minute per IP; login and register 5/minute per IP+email, register also 10/hour per IP. Responses carry `X-RateLimit-Limit`/`X-RateLimit-Remaining`; a rate-limit 429 carries `Retry-After` in seconds and Laravel's body `{ "message": "Too Many Attempts." }`, while a plan user/customer count-limit 429 has no `Retry-After` and its own body (§6).
+**Rate limits** ([caching §4](caching.md)): 60/minute per user on logged-in routes, 60/minute per IP on `GET /plans*`, 5/minute per IP+email on login and register, and 10/hour per IP on register.
 
-`ForceJsonAccept` is prepended to the `api` middleware group, so a client that sends no `Accept` header still gets JSON — including the 401 for a missing token, which would otherwise be a redirect to a login page.
+Every response carries `X-RateLimit-Limit` and `X-RateLimit-Remaining`. A throttle 429 carries `Retry-After` and says `Too Many Attempts.`; a plan-limit 429 has its own body and no `Retry-After` (§6).
 
 ## 3. Pagination, filtering, search
 
-Every listing endpoint uses the same parameter names and behaviour. Each resource has its own listing Form Request (`List{X}Request`) holding plain rules — including the whitelist of filter keys — and its service builds the query with the model's `search(columns, term)` scope from the `Searchable` trait.
+Every listing takes the same parameters. Each one has a `List{X}Request` holding the rules, including the list of allowed filter keys — which is also what keeps user input out of a column name.
 
 | Parameter | Behaviour |
 |---|---|
@@ -71,19 +71,17 @@ Every listing endpoint uses the same parameter names and behaviour. Each resourc
 | `search` | prefix match on the resource's designated searchable columns |
 | `filter[status]`, `filter[role]`, `filter[plan_id]` | whitelisted per resource; an unknown filter key is a 422, not silently ignored |
 
-Behaviour:
 - A `per_page` above 100 (or below 1), a `page` below 1, an unknown `filter` key and a filter value outside its enum are all **422** — never clamped or ignored.
 - The order is fixed: newest first (`created_at` descending, then `id` descending so rows with equal timestamps never repeat or vanish between pages). There is no `sort` parameter.
 - `search` is at most 100 characters; `%`, `_` and `\` in it match literally.
-- `links` keep the request's query string. Scramble documents the parameters from the listing Form Request's rules.
-- **`meta.total` without a table count.** `GET /customers` and `GET /users` with no `filter` and no `search` take `total` from the tenant's exact stored count (`tenant_stats`) and run only the page query; with a `filter` or `search` they count the matching rows, backed by the `(tenant_id, …)` indexes ([database §5, §7](database.md)). The response shape is the same either way. The admin tenant listing always counts — tenants are few.
-- An unknown **top-level** query parameter (`?tenant_id=1`, `?sort=name`) is ignored, not a 422: Laravel's unknown-field check reads only the request body. It reaches no query, because only validated keys are read.
-
-Whitelisting matters for more than tidiness: passing user input into a `where` column name is an injection vector. The whitelist is the control.
+- **`meta.total` does not count the table.** With no filter and no search, `GET /customers` and `GET /users` read the total from the stored counter (`tenant_stats`) and run only the page query. With a filter or a search they count the matching rows, which the indexes serve ([database §5–§6](database.md)). The shape is the same either way.
+- An unknown top-level query parameter such as `?sort=name` is ignored rather than rejected, because the unknown-field check reads the body only. It reaches no query: the controller reads validated keys only.
 
 ## 4. Validation
 
-Every write endpoint has a Form Request. Rules are declared once and read directly by the OpenAPI generator (§7), so a validation rule and its documentation can never disagree. Unknown fields are rejected rather than ignored, so a client typo fails loudly instead of silently doing nothing. On listings this covers `filter[...]` keys; unknown top-level query parameters are ignored (§3). A malformed JSON body is read as empty, so it fails as missing required fields (422), not as a 400.
+Every write endpoint has a Form Request. The same rules are read by the OpenAPI generator (§7), so the documentation cannot disagree with the validation.
+
+Unknown fields are rejected, not ignored, so a client typo fails loudly instead of doing nothing. On listings that covers `filter[...]` keys too. Broken JSON reads as an empty body, so it fails as missing required fields (422).
 
 ## 5. Endpoints
 
@@ -91,7 +89,7 @@ Every write endpoint has a Form Request. Rules are declared once and read direct
 | Method | Path | Notes |
 |---|---|---|
 | POST | `/auth/register` | Creates tenant **and** its owner user in one transaction. Assigns the Free plan. Returns token + tenant + user. Throttled per IP+email (5/min, shared with login) and per IP (10/hour). |
-| POST | `/auth/login` | Throttled per IP+email (5/min, shared with register). Generic failure message: 422 on `email`, identical for unknown email and wrong password. Disabled account → 403. |
+| POST | `/auth/login` | Throttled per IP+email. Generic failure message: 422 on `email`, identical for unknown email and wrong password. Disabled account → 403. |
 | POST | `/auth/logout` | Revokes the presented token only. 204. |
 | GET | `/auth/me` | Current user with tenant and role, for every authenticated user (no tenant middleware). `tenant` is `null` for a platform admin. |
 
@@ -133,13 +131,6 @@ Authorization: Bearer 2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758
 200 { "data": { "id": 9, "name": "Peter Gibbons", "email": "peter@initech.test", "role": "owner", "status": "active",
                 "tenant": { "id": 3, "name": "Initech", "slug": "initech", "status": "active", "timezone": "Asia/Dhaka" } } }
 ```
-```http
-POST /api/v1/auth/logout
-Authorization: Bearer 2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758
-```
-```json
-204 (no body); the same token on GET /auth/me then gets 401 { "message": "Unauthenticated." }
-```
 
 ### Tenant (current company)
 | Method | Path | Role |
@@ -147,10 +138,10 @@ Authorization: Bearer 2|9ohrRflV4TqXSeWD6dHDMJG6sSq952esLbuGH30c6ce09758
 | GET | `/tenant` | any member |
 | PATCH | `/tenant` | owner, admin |
 
-- **Only the caller's own tenant** is addressed — it is the tenant `ResolveTenant` already put in `TenantContext`, so `GET` runs no query of its own (read from the `tenant:{id}` cache, [caching §1](caching.md)). There is no id to point at another tenant.
-- **Response:** the `tenant` object of the auth responses, `{ "data": { "id", "name", "slug", "status", "timezone" } }`, for GET and PATCH (200).
-- **PATCH body:** any subset of `name` (≤255) and `timezone` (an IANA zone id such as `Europe/London`; an offset like `+06:00` is a 422). `slug` is fixed once registered and `status` belongs to the platform admin (`PATCH /admin/tenants/{id}`), so sending either is a 422 like any unknown field. `TenantObserver` drops the cached tenant after the update commits.
-- **Changing `timezone` applies from the next request:** new customers' dashboard growth month follows the new zone; past months already written are not re-bucketed.
+- **Only the caller's own tenant** is addressed — the one `ResolveTenant` already put in `TenantContext`, so `GET` runs no query of its own (read from the `tenant:{id}` cache). There is no id to point at another tenant.
+- **Response:** `{ "data": { "id", "name", "slug", "status", "timezone" } }`, for GET and PATCH (200).
+- **PATCH body:** any subset of `name` and `timezone` (an IANA zone id; an offset like `+06:00` is a 422). `slug` is fixed once registered and `status` belongs to the platform admin, so sending either is a 422 like any unknown field.
+- **Changing `timezone` applies from the next request:** new customers' dashboard growth month follows the new zone; past months are not re-bucketed.
 
 ```http
 PATCH /api/v1/tenant
@@ -169,17 +160,16 @@ PATCH /api/v1/tenant
 | PATCH | `/users/{id}` | owner, admin | partial; role rules below |
 | DELETE | `/users/{id}` | owner | hard delete, 204; revokes the user's tokens |
 
-Details:
-- **Body:** POST takes `name`, `email` (trimmed and lower-cased, **unique across all tenants** — it is the login), `password` (8–72), `role` (`owner`/`admin`/`member`); new users are `active`. PATCH accepts any subset of `name`, `email`, `role`, `status` (`active`/`disabled`); no password change.
-- **Response:** the `user` object of `/auth/me` without `tenant`: `{ "data": { "id", "name", "email", "role", "status" } }`.
+- **Body:** POST takes `name`, `email` (trimmed and lower-cased, **unique across all tenants** — it is the login), `password` (8–72), `role`; new users are `active`. PATCH accepts any subset of `name`, `email`, `role`, `status`; no password change.
+- **Response:** `{ "data": { "id", "name", "email", "role", "status" } }`.
 - **Role rules**, checked in `UserService` after the ability gate:
   1. You cannot grant a role above your own (create or update) → 403.
-  2. You cannot modify or delete a user whose role is above your own, so an admin cannot demote or disable the owner → 403.
+  2. You cannot modify or delete a user whose role is above your own → 403.
   3. You cannot change your own role → 403.
-  4. The last active owner cannot be deleted, demoted or disabled → 409. This is checked before rule 3, so a sole owner demoting themselves learns why.
+  4. The last active owner cannot be deleted, demoted or disabled → 409. Checked before rule 3, so a sole owner demoting themselves learns why.
 - **Disabling or deleting a user deletes their tokens**, so access ends on the next request. A role change keeps them: gates read the role on every request.
 
-Samples below run as `owner@acme.test` unless the heading says otherwise. Error bodies are shown without the stack trace the local `APP_DEBUG=true` adds.
+Samples run as `owner@acme.test` unless the heading says otherwise.
 
 ```http
 GET /api/v1/users?per_page=2
@@ -195,14 +185,6 @@ GET /api/v1/users?per_page=2
                 "path": "http://localhost:8000/api/v1/users", "per_page": 2, "to": 2, "total": 4 } }
 ```
 ```http
-GET /api/v1/users?filter[role]=member&search=acme&per_page=2
-```
-```json
-200 { "data": [ { "id": 5, "name": "Acme Member Two", … }, { "id": 4, "name": "Acme Member One", … } ],
-      "links": { "first": "http://localhost:8000/api/v1/users?filter%5Brole%5D=member&search=acme&per_page=2&page=1", …, "next": null },
-      "meta": { "current_page": 1, "last_page": 1, "per_page": 2, "total": 2, … } }
-```
-```http
 POST /api/v1/users
 { "name": "Jane Cooper", "email": "Jane.Cooper@acme.test", "password": "password123", "role": "member" }
 ```
@@ -210,23 +192,11 @@ POST /api/v1/users
 201 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "member", "status": "active" } }
 ```
 ```http
-GET /api/v1/users/10
-```
-```json
-200 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "member", "status": "active" } }
-```
-```http
 PATCH /api/v1/users/10
 { "role": "admin", "status": "disabled" }
 ```
 ```json
 200 { "data": { "id": 10, "name": "Jane Cooper", "email": "jane.cooper@acme.test", "role": "admin", "status": "disabled" } }
-```
-```http
-DELETE /api/v1/users/10
-```
-```json
-204 (no body)
 ```
 ```http
 GET /api/v1/users/6    (a Globex user)
@@ -271,12 +241,10 @@ POST /api/v1/users
 | PATCH | `/customers/{id}` | any member | partial; 404 across tenants |
 | DELETE | `/customers/{id}` | owner, admin | hard delete, 204; 404 across tenants |
 
-Details:
-- **Members create and edit customers; only owners and admins delete them.** Customers are day-to-day working records, so every staff member maintains them; deletion is permanent (no soft deletes), so it is held back from `member`.
-- **Body:** `name` (required, ≤255), `email` (required, trimmed and lower-cased, **unique within the tenant** — the same email at another tenant is allowed), `phone` (≤32, nullable), `status` (`active`/`inactive`, defaults to `active`). PATCH accepts any subset.
+- **Members create and edit customers; only owners and admins delete them.** Customers are day-to-day working records, so every staff member maintains them; deletion is permanent, so it is held back from `member`.
+- **Body:** `name` (required), `email` (required, trimmed and lower-cased, **unique within the tenant**), `phone` (nullable), `status` (defaults to `active`). PATCH accepts any subset.
 - **Response:** `{ "data": { "id", "name", "email", "phone", "status" } }` — one shape for the listing and a single customer.
-- **Authorization runs before validation**, so a caller without the ability gets 403 whatever the body.
-- **Flow:** route (`->can(Ability::X)`, `{id}` numeric only) → controller → Form Request → `CustomerService` → `CustomerResource`. `CustomerService::find()` is a `findOrFail` through the tenant scope, so another tenant's id is a 404 like a missing one. A non-numeric id does not match the route (404).
+- **Authorization runs before validation**, so a caller without the ability gets 403 whatever the body. A cross-tenant id is a 404 like a missing one, and a non-numeric id does not match the route.
 
 ```http
 GET /api/v1/customers?per_page=2
@@ -290,24 +258,11 @@ GET /api/v1/customers?per_page=2
                 "per_page": 2, "to": 2, "total": 8 } }
 ```
 ```http
-GET /api/v1/customers?filter[status]=inactive&search=o&per_page=2
-```
-```json
-200 { "data": [ { "id": 8, "name": "Oakridge Print House", "email": "team@oakridge-print.test", "phone": null, "status": "inactive" } ],
-      "links": { …, "next": null }, "meta": { "current_page": 1, "last_page": 1, "per_page": 2, "to": 1, "total": 1, … } }
-```
-```http
 POST /api/v1/customers
 { "name": "Northwind Traders", "email": "Sales@Northwind.test", "phone": "+8801711000000" }
 ```
 ```json
 201 { "data": { "id": 15, "name": "Northwind Traders", "email": "sales@northwind.test", "phone": "+8801711000000", "status": "active" } }
-```
-```http
-GET /api/v1/customers/15
-```
-```json
-200 { "data": { "id": 15, "name": "Northwind Traders", "email": "sales@northwind.test", "phone": "+8801711000000", "status": "active" } }
 ```
 ```http
 PATCH /api/v1/customers/15
@@ -322,12 +277,6 @@ POST /api/v1/customers
 ```
 ```json
 422 { "message": "The email has already been taken.", "errors": { "email": [ "The email has already been taken." ] } }
-```
-```http
-DELETE /api/v1/customers/15
-```
-```json
-204 (no body)
 ```
 ```http
 GET /api/v1/customers/9    (a Globex customer, requested as Acme)
@@ -347,17 +296,16 @@ POST /api/v1/customers
 ### Plans
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| GET | `/plans` | public | active plans with their features, in display order (the plan's `sort_order`, then `id`; `sort_order` itself is not returned); paginated (`page`, `per_page`), served from cache |
-| GET | `/plans/{slug}` | public | any plan, an inactive one included (`is_active` says so); 404 for an unknown slug; served from cache |
+| GET | `/plans` | public | active plans with their features, in display order; paginated, served from cache |
+| GET | `/plans/{slug}` | public | any plan, an inactive one included (`is_active` says so); 404 for an unknown slug |
 | POST | `/admin/plans` | platform_admin | 201 |
 | PATCH | `/admin/plans/{id}` | platform_admin | partial, feature limits included |
 | DELETE | `/admin/plans/{id}` | platform_admin | 204; a plan any subscription refers to → 409 |
 
-Details:
-- **Body:** POST takes `name` (≤255), `slug` (lower-case letters, digits and single hyphens, unique), `price_cents` (integer ≥ 0, minor units), `currency` (three upper-case letters), `billing_period` (`monthly`/`yearly`), `is_active` (default `true`), `sort_order` (0–32767, default `0`) and `features` — an object with **every** feature key (`max_users`, `max_customers`), each an integer ≥ 0 or `null` for unlimited. PATCH accepts any subset of those except `slug`, which is fixed once created; `features` may carry only the limits that change.
-- **Response:** `{ "data": { "id", "name", "slug", "price_cents", "currency", "billing_period", "is_active", "features": { "max_users": 3, "max_customers": 10 } } }` — one shape for the listing, a single plan and the admin writes.
+- **Body:** POST takes `name`, `slug` (lower-case letters, digits and single hyphens, unique), `price_cents` (minor units), `currency`, `billing_period` (`monthly`/`yearly`), `is_active`, `sort_order` and `features` — an object with **every** feature key, each an integer ≥ 0 or `null` for unlimited. PATCH accepts any subset except `slug`, which is fixed once created; `features` may carry only the limits that change.
+- **Response:** `{ "data": { "id", "name", "slug", "price_cents", "currency", "billing_period", "is_active", "features": { "max_users": 3, "max_customers": 10 } } }`.
 - **Deleting** a plan is refused with 409 while any subscription row refers to it — a canceled or expired one included, because the foreign key restricts on every row and plan history must survive. Deactivate it instead (`is_active: false`): it leaves the listing and stays readable by slug, and existing subscriptions are untouched.
-- A tenant user of any role gets 403 on the admin routes; authorization runs before validation.
+- A tenant user of any role gets 403 on the admin routes.
 
 ```http
 POST /api/v1/admin/plans
@@ -375,19 +323,18 @@ POST /api/v1/admin/plans
 |---|---|---|---|
 | GET | `/subscription` | any member | current plan, status, period, limits |
 | POST | `/subscription` | owner | subscribe; 409 if already active |
-| PATCH | `/subscription` | owner | change plan. **A downgrade is refused with 422 when current usage exceeds the target plan's limits**, naming the offending feature — silently breaking the invariant would be worse than refusing. |
-| DELETE | `/subscription` | owner | cancel; runs to the end of the current billing period (set as `ends_at`) rather than terminating immediately; 200 with the subscription |
+| PATCH | `/subscription` | owner | change plan. **A downgrade is refused with 422 when current usage exceeds the target plan's limits**, naming the offending feature. |
+| DELETE | `/subscription` | owner | cancel; runs to the end of the current billing period rather than terminating immediately; 200 with the subscription |
 | GET | `/subscription/usage` | any member | per-feature `used` / `limit` / `remaining`, `null` limit = unlimited |
 
-Details:
-- **Body:** POST and PATCH take `plan` — the slug of an **active** plan. An unknown or inactive slug is a 422 on `plan` (`The selected plan is invalid.`). Unknown fields are a 422 as everywhere else.
-- **Response:** `{ "data": { "id", "status", "starts_at", "ends_at", "canceled_at", "plan": { …the plan object of /plans, features included… } } }` for GET, POST (201), PATCH (200) and DELETE (200). The limits are the plan's `features`. `ends_at` is `null` while the subscription runs uncanceled; it is set only by cancelling or changing plan.
+- **Body:** POST and PATCH take `plan` — the slug of an **active** plan. An unknown or inactive slug is a 422 on `plan`.
+- **Response:** `{ "data": { "id", "status", "starts_at", "ends_at", "canceled_at", "plan": { …the plan object of /plans… } } }` for GET, POST (201), PATCH (200) and DELETE (200). The limits are the plan's `features`. `ends_at` is `null` while the subscription runs uncanceled.
 - **Only the live subscription is addressed** — the tenant's one `active` row. With none (it expired), GET, PATCH, DELETE and usage are 404, and POST is the way back in; POST while one is live is 409.
-- **Changing plan** ends the live subscription now (`status: canceled`, `canceled_at` and `ends_at` set to now) and starts a new `active` one on the target plan with `ends_at: null`, in one transaction. History is kept; there is no proration. The same plan again is 409.
-- **The downgrade rule** applies to every plan change and to POST: when the tenant's current `max_users` or `max_customers` usage is above the target plan's limit, the request is a 422 on `plan` with one message per feature over the limit. Usage exactly at the limit is allowed.
-- **Cancelling** sets `canceled_at` to now and `ends_at` to the end of the current billing period — the first boundary after now, counted in whole months or years from `starts_at` (a month-end start clamps, e.g. started 31 Jan → ends 30 Sep, without drifting). The subscription stays `active` until `ends_at`. A second cancel is 409.
-- **Period end** (hourly job, [caching §7](caching.md)): there is no billing, so nothing renews — an uncanceled subscription simply keeps running with `ends_at: null`. A canceled one becomes `expired` once `ends_at` passes, after which the tenant has no live subscription. The change can trail `ends_at` by up to an hour. A canceled subscription may still change plan, which starts a fresh, uncanceled one.
-- **Usage** covers the features with something to measure: `max_users` and `max_customers` (the tenant's stored counts, every status, exact — §6). `remaining` is `null` for an unlimited feature and never below `0`.
+- **Changing plan** ends the live subscription now (`canceled`, `canceled_at` and `ends_at` set to now) and starts a new `active` one with `ends_at: null`, in one transaction. History is kept; there is no proration. The same plan again is 409.
+- **The downgrade rule** applies to every plan change and to POST: when current `max_users` or `max_customers` usage is above the target plan's limit, the request is a 422 on `plan` with one message per feature over the limit. Usage exactly at the limit is allowed.
+- **Cancelling** sets `canceled_at` to now and `ends_at` to the first billing-period boundary after now, counted in whole months or years from `starts_at` (a month-end start clamps without drifting). The row stays `active` until `ends_at`. A second cancel is 409.
+- **Period end** is handled by the hourly job ([caching §5](caching.md)): a canceled subscription becomes `expired` once `ends_at` passes. Nothing renews — there is no billing.
+- **Usage** covers `max_users` and `max_customers` (the tenant's stored counts, every status, exact — §6). `remaining` is `null` for an unlimited feature and never below `0`.
 
 ```http
 GET /api/v1/subscription
@@ -423,15 +370,13 @@ GET /api/v1/subscription/usage
 ### Dashboard
 | Method | Path | Role | Notes |
 |---|---|---|---|
-| GET | `/dashboard/analytics` | any member | the live plan, usage per feature (users and customers against the limits), customers added in each of the last 12 months; read from stored counters, not cached |
+| GET | `/dashboard/analytics` | any member | the live plan, usage per feature, customers added in each of the last 12 months; read from stored counters, not cached |
 
-Details:
 - **Authorization:** ability `dashboard:view`, held by owner, admin and member; a platform admin gets 403 from the tenant middleware.
-- **Response:** `plan` (`id`, `name`, `slug`); `usage` — the same object as `GET /subscription/usage`, so the user and customer totals (every status) are its `used` values and the ratio is `used`/`limit`; `customer_growth` — twelve `{ month, customers_added }` entries, oldest first, ending with the current month. **Months are the tenant's** (`tenants.timezone`): a customer created at 23:30 UTC on 30 September belongs to October for an `Asia/Dhaka` tenant. A month nobody was added in reads `0`.
+- **Response:** `plan` (`id`, `name`, `slug`); `usage` — the same object as `GET /subscription/usage`; `customer_growth` — twelve `{ month, customers_added }` entries, oldest first, ending with the current month. **Months are the tenant's** (`tenants.timezone`): a customer created at 23:30 UTC on 30 September belongs to October for an `Asia/Dhaka` tenant. A month nobody was added in reads `0`.
 - **Growth counts additions.** A deleted customer stays in the month it was added; the current total is `usage.max_customers.used`.
 - **No live subscription** (it expired): 404, like `/subscription/usage`, which the response is built on.
-- **The request aggregates nothing** ([database §2 `tenant_monthly_stats`](database.md)): on a warm cache it runs two queries — the `tenant_stats` primary-key read behind `usage`, and at most twelve `tenant_monthly_stats` rows by primary-key range. The gaps are filled in PHP. The query count does not change with the tenant's size (a test asserts the exact SQL, with no `count`, `sum` or `GROUP BY`).
-- Totals by status (active/inactive customers or users) are not reported: they would need a status-change counter on every update, and nothing asked for more than the totals the plan limits already count.
+- **The request aggregates nothing** ([database §2](database.md)): on a warm cache it runs two queries — the `tenant_stats` primary-key read behind `usage`, and at most twelve `tenant_monthly_stats` rows by primary-key range, with gaps filled in PHP. The query count does not change with the tenant's size (a test asserts the exact SQL).
 
 ```
 GET /api/v1/dashboard/analytics    (Acme, seeded)
@@ -453,13 +398,10 @@ GET /api/v1/dashboard/analytics    (Acme, seeded)
 | PATCH | `/admin/tenants/{id}` | body `status` (`active`/`suspended`) only; 200 with the same shape as the listing; unknown id → 404 |
 | GET | `/admin/analytics` | platform-wide totals, and each plan's live tenants and MRR in cents; read from job-maintained summary tables, cached 24 h |
 
-Details:
-- **Authorization:** `auth:sanctum` without the `tenant` middleware; abilities `tenants:manage` (both tenant routes) and `platform-analytics:view`, held by `platform_admin` only. A tenant user of any role gets 403 before validation.
-- **No tenant-owned model is queried through its scope here.** `Tenant` and `Plan` are not tenant-scoped; the counts come from the `tenant_stats` table joined by name.
-- **Plan** is the live (`active`) subscription's plan, joined — at most one row per tenant because the join repeats the partial unique index's predicate, so `meta.total` stays exact. `null` when the tenant has no live subscription. `filter[plan_id]` filters on that join.
-- **Usage** is `users` (every status) and `customers` from `tenant_stats`, left-joined on its primary key — never a count of the tenants' rows, and exact (§6). The listing is two queries (count, page) however many tenants the page holds.
-- **Suspend / reactivate** writes `status`; `TenantObserver` drops the cached tenant and queues the platform stats refresh after commit, so the tenant's users get 403 (`This tenant account is suspended.`) from their next tenant request, and are let back in the same way. Tokens are not revoked ([system design](system-design.md) §3); `/auth/me` still answers for them. Writing the current status again is a 200.
-- **Analytics:** `tenants` counts every tenant, the suspended ones, and `active` as the difference; `users` excludes platform admins; `plans` lists every plan in display order with its live subscription count and `mrr_cents` in its own `currency` — every `active` subscription pays (a canceled-but-running one still counts until `ends_at`), a yearly price divided by 12 and rounded down. There is no platform-wide MRR total: plans may differ in currency, and a client sums the plan rows it wants. **The request aggregates nothing**: it selects the `platform_stats` row and `plan_stats` joined to `plans` ([database §2](database.md)); `RefreshPlatformStats` computes them on the queue ~30 s after a tenant, subscription, plan, user or customer write, so figures lag by up to ~30 s plus queue wait. Zeros before the first refresh. Two queries on a miss, **cached 24 h** under `platform:analytics`, dropped when a stats row actually changes ([caching](caching.md) §1–§2); a hit runs no query.
+- **Authorization:** `auth:sanctum` without the `tenant` middleware; abilities `tenants:manage` and `platform-analytics:view`, held by `platform_admin` only.
+- **Plan** is the live (`active`) subscription's plan, joined — at most one row per tenant because the join repeats the partial unique index's predicate, so `meta.total` stays exact. `null` when the tenant has no live subscription. **Usage** comes from `tenant_stats`, left-joined on its primary key — never a count of the tenants' rows. The listing is two queries however many tenants the page holds.
+- **Suspend / reactivate** writes `status`; `TenantObserver` drops the cached tenant after commit, so the tenant's users get 403 from their next tenant request, and are let back in the same way. Tokens are not revoked ([system design §3](system-design.md)); `/auth/me` still answers for them.
+- **Analytics:** `tenants` counts every tenant, the suspended ones, and `active` as the difference; `users` excludes platform admins; `plans` lists every plan with its live subscription count and `mrr_cents` in its own `currency` (a yearly price ÷ 12, rounded down). There is no platform-wide MRR total: plans may differ in currency. **The request aggregates nothing** — it selects the `platform_stats` row and `plan_stats` joined to `plans`; `RefreshPlatformStats` computes them on the queue ~30 s after a write, so figures lag by that much, and read zeros before the first refresh.
 
 ```
 GET /api/v1/admin/tenants?filter[plan_id]=2
@@ -490,45 +432,18 @@ GET /api/v1/admin/analytics
 `POST /users` checks `max_users` and `POST /customers` checks `max_customers`, from `UserService::create()` and `CustomerService::create()` through one method, `SubscriptionService::ensureWithinLimit(FeatureKey)`. No middleware and no per-feature checker classes: the two count-based limits share one rule.
 
 - **The limit** is the tenant's live subscription's plan feature, read from the cache (`tenant:{id}:subscription` → `plan:{slug}`), so a platform admin's limit edit applies on the next create.
-- **The usage** is the tenant's stored count in `tenant_stats` — the same value as `GET /subscription/usage`, one primary-key lookup of the created resource's column, never a `count(*)` of the table. The `Customer`/`User` observers increment and decrement it inside the create's or delete's transaction, so it is exact the moment the write commits; a delete frees a slot immediately.
-- **The limit is exact under concurrency.** The check and the insert share one transaction, and the count is read `FOR UPDATE`: a concurrent create for the same tenant waits for the first to commit, then sees its row. Creates are therefore serialised per tenant — the accepted cost ([database §2, §7](database.md)).
-- `null` limit = unlimited: the counter is neither read nor locked. `0` blocks every create. **A create is refused when `used >= limit`**: with 3 of 3 users the next create is a 429, with 2 of 3 it succeeds.
-- The check runs after validation, and for users after the role rule (a 403 wins over a 429). Nothing is written on a 429.
-- **No `Retry-After`.** A count limit does not reset with time — only an upgrade or a delete frees a slot — so there is no honest value to send.
+- **The usage** is the tenant's stored count in `tenant_stats` — the same value as `GET /subscription/usage`, one primary-key lookup, never a `count(*)` of the table. The observers adjust it inside the create's or delete's transaction, so a delete frees a slot immediately.
+- **The limit is exact under concurrency.** The check and the insert share one transaction, and the count is read `FOR UPDATE`, so a tenant's creates queue behind each other ([database §2](database.md)).
+- `null` limit = unlimited; `0` blocks every create. **A create is refused when `used >= limit`.** The check runs after validation, and for users after the role rule (a 403 wins over a 429). Nothing is written on a 429, and there is **no `Retry-After`**: a count limit does not reset with time.
 - **No live subscription** (a canceled subscription expired): the create answers 404, like every `/subscription` endpoint.
-- Samples of both 429 bodies are under Users and Customers in §5.
 
-## 7. API documentation tooling — Scramble, not L5-Swagger
+## 7. API documentation
 
-**Decision: `dedoc/scramble`** (OpenAPI 3.1 generator), rejecting the more common `darkaonline/l5-swagger`.
+`dedoc/scramble` builds the OpenAPI 3.1 spec from the Form Requests, API Resources, enums and route bindings. There are no annotations in the controllers, so the spec cannot drift from the code. The spec is served at `/docs/api.json`, and Swagger UI reads it at `/api/documentation`, where a reviewer can log in and call every endpoint.
 
-L5-Swagger wraps `swagger-php`, which documents an endpoint through `@OA\Get(...)` annotation blocks written above each controller method — typically 20-40 lines per endpoint. Across the ~30 endpoints in §5 that is several hundred lines of annotation living inside the controllers. Two problems:
+Scramble reads structure, not intent, so four things are written by hand, one line each:
 
-1. It contradicts this project's comment rule (root `CLAUDE.md`): docblocks are capped at one or two lines of description plus tags. Hand-written annotation blocks are exactly the kind of comment that goes stale the moment a validation rule changes.
-2. It duplicates information the code already states. The request shape is in the Form Request, the response shape is in the API Resource, the parameter types are in the route binding. Restating all three in an annotation means three places to update and two of them will be forgotten.
-
-Scramble derives the specification from those same structures — Form Requests, API Resources, enums, route model binding, type hints — with **no annotations at all**. The design decisions already made in [system design §6](system-design.md) and §2-§4 of this document are precisely what it reads, so the documentation is a by-product of the architecture rather than a parallel artifact.
-
-**Generation and presentation are separate concerns**, and only the first is what Scramble is chosen for:
-
-| Concern | Tool | Why |
-|---|---|---|
-| Produce the OpenAPI 3.1 spec | **Scramble**, from Form Requests / API Resources / route bindings | no annotations, cannot drift from the code |
-| Present it to a reviewer | **Swagger UI**, pointed at that spec | the interface the client asked for, and the one reviewers recognise |
-
-Scramble ships its own UI (Stoplight Elements / Scalar). That is replaced: Swagger UI is served at **`/api/documentation`**, reading the spec at **`/docs/api.json`**. Swagger UI is a static asset pointed at any OpenAPI URL, so this costs a route and a blade view — it does not constrain the generator.
-
-**What it produces**
-- An OpenAPI 3.1 JSON spec at `/docs/api.json`
-- **Swagger UI at `/api/documentation`** — a reviewer opens one URL, reads every endpoint, and calls the API from the browser with a bearer token
-- A standard OpenAPI file any client can consume — but the deliverable is the hosted Swagger UI, not a file to import
-
-**Where hand-written text is still needed.** Scramble infers structure, not intent. Short one- or two-line docblock descriptions on controller methods become endpoint summaries, and the non-obvious behaviours — the 429 on a plan limit, the 422 on a downgrade below usage, 404-not-403 for cross-tenant — are documented explicitly rather than inferred. That prose belongs in the README's API section, not in annotations.
-
-The few places Scramble cannot see, filled with one line each rather than annotation blocks:
-- **Array responses** (`/subscription/usage`, `/dashboard/analytics`, `/admin/analytics`) return `JsonResource::make($array)`, which Scramble cannot look inside: an `@response array{data: …}` tag on the controller method gives the shape.
-- **Computed resource fields** (a plan's `features` object, the admin tenant listing's joined `plan` and `usage`): an `@var array{…}` above the array item.
-- **Errors thrown inside a service** (`abort_if` 409s, the plan-limit 429 on `POST /users` and `POST /customers`) are not propagated to the controller's operation: a `#[Response(status, description, type)]` attribute on the controller method.
-- **Cross-endpoint behaviour** (throttle 429s, 403 for a suspended tenant, 404 across tenants) is stated once in the spec's description (`config/scramble.php` `info.description`), shown at the top of Swagger UI, rather than repeated on ~30 operations.
-
-**Risk, stated plainly.** Scramble is pre-1.0 (v0.13.x as of Aug 2026). Its Laravel 13 support was verified at install time: **0.13.43 resolves against Laravel 13.32 and generates an OpenAPI 3.1 spec, so the fallback was not needed.** Had it failed, the fallback was a **hand-written `openapi.yaml`** served through the same Swagger UI — roughly an extra hour, still Swagger, still no annotations in the controllers, but it must be kept in step with the code by hand. L5-Swagger remains rejected either way, for the reasons above. The decision is reversible at that point and nowhere later.
+- **Array responses** (`/subscription/usage`, `/dashboard/analytics`, `/admin/analytics`) get an `@response array{...}` tag on the controller method.
+- **Computed fields** (a plan's `features`, the admin listing's `plan` and `usage`) get an `@var array{...}`.
+- **Errors thrown inside a service** (the 409s, the plan-limit 429) get a `#[Response(...)]` attribute.
+- **Rules that apply everywhere** (throttle 429, 403 for a suspended tenant, 404 across tenants) are written once in the spec description, shown at the top of Swagger UI.
